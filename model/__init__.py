@@ -7,7 +7,6 @@ import importlib
 from abc import abstractmethod
 from .ddpm.unet import create_model
 from .precond import VPPrecond, LatentDMWrapper
-from diffusers import StableDiffusionPipeline
 from cores.scheduler import VPScheduler
 
 
@@ -216,6 +215,13 @@ class StableDiffusionModel(LatentDiffusionModel):
     """
     def __init__(self, model_id = "stabilityai/stable-diffusion-2-1", inner_resolution=768, target_resolution=256, guidance_scale=7.5, prompt='a natural looking human face', device='cuda', hf_home='checkpoints/.cache/huggingface'):
         super().__init__()
+        try:
+            from diffusers import StableDiffusionPipeline
+        except ImportError as exc:
+            raise ImportError(
+                "Stable diffusion dependencies are not installed. "
+                "Install diffusers/transformers-related packages to use model name 'sdm'."
+            ) from exc
         pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
         self.pipe = pipe.to(device)
         self.vae = self.pipe.vae
