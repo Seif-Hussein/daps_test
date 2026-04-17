@@ -13,13 +13,21 @@ from omegaconf import OmegaConf
 from evaluate_fid import calculate_fid
 from torch.utils.data import DataLoader
 import hydra
-import wandb
-import setproctitle
 from PIL import Image
 import numpy as np
 import imageio
 
 import os
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    import setproctitle
+except ImportError:
+    setproctitle = None
 
 
 def resize(y, x, task_name):
@@ -168,7 +176,8 @@ def main(args):
     torch.backends.cudnn.deterministic = True
     torch.cuda.set_device('cuda:{}'.format(args.gpu))
 
-    setproctitle.setproctitle(args.name)
+    if setproctitle is not None:
+        setproctitle.setproctitle(args.name)
     print(yaml.dump(OmegaConf.to_container(args, resolve=True), indent=4))
 
     # get data
@@ -202,6 +211,8 @@ def main(args):
 
     # logging to wandb
     if args.wandb:
+        if wandb is None:
+            raise ImportError("wandb is not installed but args.wandb=True")
         wandb.init(
             project=args.project_name,
             name=args.name,

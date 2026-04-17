@@ -3,9 +3,13 @@ from piq import psnr, ssim, LPIPS
 import prettytable
 import torch
 import torch.nn as nn
-import wandb
 import numpy as np
 import warnings
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 class Evaluator:
@@ -93,6 +97,8 @@ class Evaluator:
         return table.get_string()
 
     def log_wandb(self, result_dicts, batch_size):
+        if wandb is None:
+            raise ImportError("wandb is not installed")
         for s in range(batch_size):
             log_dict = {key: result_dicts[key][get_eval_fn_cmp(key)][s] for key in result_dicts.keys()}
             wandb.log(log_dict)
