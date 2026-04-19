@@ -19,6 +19,7 @@ import imageio
 
 import os
 from datetime import datetime, timezone
+from time import perf_counter
 
 try:
     import wandb
@@ -96,6 +97,8 @@ def build_progress_state(
     x0y_results=None,
     status='running',
     message=None,
+    started_at=None,
+    elapsed_seconds=None,
 ):
     progress = {
         'status': status,
@@ -112,6 +115,11 @@ def build_progress_state(
         'task_name': args.task[args.task_group].operator.name,
         'run_name': args.name,
     }
+    if started_at is not None:
+        progress['started_at'] = started_at
+    if elapsed_seconds is not None:
+        progress['elapsed_seconds'] = elapsed_seconds
+
     if sigma is not None:
         progress['sigma'] = to_python_scalar(sigma)
 
@@ -205,6 +213,8 @@ def sample_in_batch(
     root,
     run_id,
     progress_path=None,
+    started_at=None,
+    run_start_perf_counter=None,
 ):
     """
         posterior sampling in batch
@@ -232,6 +242,8 @@ def sample_in_batch(
                     x0hat_results=payload.get('x0hat_results'),
                     x0y_results=payload.get('x0y_results'),
                     status='running',
+                    started_at=started_at,
+                    elapsed_seconds=perf_counter() - run_start_perf_counter if run_start_perf_counter is not None else None,
                 )
                 write_json(progress_path, progress_state)
             sampler.progress_callback = progress_callback
@@ -415,6 +427,25 @@ def main(args):
     record_metrics = args.save_evolution_metrics
     for r in range(args.num_runs):
         print(f'Run: {r}')
+        run_started_at = now_iso()
+        run_start_perf_counter = perf_counter()
+        write_json(progress_path, {
+            'status': 'running',
+            'message': 'Sampling in progress',
+            'updated_at': run_started_at,
+            'started_at': run_started_at,
+            'elapsed_seconds': 0.0,
+            'run_id': r,
+            'num_runs': args.num_runs,
+            'step': 0,
+            'num_steps': sampler.annealing_scheduler.num_steps - 1,
+            'batch_start': 0,
+            'batch_end': 0,
+            'batch_size': 0,
+            'total_images': total_number,
+            'task_name': args.task[args.task_group].operator.name,
+            'run_name': args.name,
+        })
         x_start = sampler.get_start(images.shape[0], model)
         samples, trajs = sample_in_batch(
             sampler,
@@ -432,6 +463,8 @@ def main(args):
             root=root,
             run_id=r,
             progress_path=progress_path,
+            started_at=run_started_at,
+            run_start_perf_counter=run_start_perf_counter,
         )
         full_samples.append(samples)
         if trajs is not None:
@@ -501,6 +534,8 @@ def main(args):
         'status': 'completed',
         'message': f'finish {args.name}!',
         'updated_at': now_iso(),
+        'started_at': run_started_at,
+        'elapsed_seconds': perf_counter() - run_start_perf_counter,
         'run_name': args.name,
         'num_runs': args.num_runs,
         'total_images': total_number,
