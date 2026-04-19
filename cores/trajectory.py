@@ -46,7 +46,13 @@ class Trajectory(nn.Module):
             for name in self.tensor_data.keys():
                 self.tensor_data[name] = torch.stack(self.tensor_data[name], dim=0)
             for name in self.value_data.keys():
-                self.value_data[name] = torch.tensor(self.value_data[name])
+                values = self.value_data[name]
+                if len(values) == 0:
+                    self.value_data[name] = torch.tensor([])
+                elif torch.is_tensor(values[0]):
+                    self.value_data[name] = torch.stack([v.detach().cpu() for v in values], dim=0)
+                else:
+                    self.value_data[name] = torch.tensor(values)
         return self
 
     @classmethod
@@ -61,6 +67,9 @@ class Trajectory(nn.Module):
         for name in trajs[0].tensor_data.keys():
             merged_traj.tensor_data[name] = torch.cat([traj.tensor_data[name] for traj in trajs], dim=1)
         for name in trajs[0].value_data.keys():
-            merged_traj.value_data[name] = trajs[0].value_data[name]
+            value = trajs[0].value_data[name]
+            if value.ndim <= 1:
+                merged_traj.value_data[name] = value
+            else:
+                merged_traj.value_data[name] = torch.cat([traj.value_data[name] for traj in trajs], dim=1)
         return merged_traj
-

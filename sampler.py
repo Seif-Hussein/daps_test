@@ -39,7 +39,7 @@ class DAPS(nn.Module):
         self.diffusion_scheduler_config = diffusion_scheduler_config
         self.mcmc_sampler = MCMCSampler(**mcmc_sampler_config)
 
-    def sample(self, model, x_start, operator, measurement, evaluator=None, record=False, verbose=False, **kwargs):
+    def sample(self, model, x_start, operator, measurement, evaluator=None, record=False, record_metrics=False, verbose=False, **kwargs):
         """
         Performs sampling using the DAPS method.
 
@@ -57,8 +57,9 @@ class DAPS(nn.Module):
         Returns:
             torch.Tensor: Final sampled tensor/state.
         """
-        if record:
+        if record or record_metrics:
             self.trajectory = Trajectory()
+        self.record_tensors = record
         pbar = tqdm.trange(self.annealing_scheduler.num_steps - 1) if verbose else range(self.annealing_scheduler.num_steps - 1)
         xt = x_start
         for step in pbar:
@@ -83,26 +84,27 @@ class DAPS(nn.Module):
             if evaluator and 'gt' in kwargs:
                 with torch.no_grad():
                     gt = kwargs['gt']
-                    x0hat_results = evaluator(gt, measurement, x0hat)
-                    x0y_results = evaluator(gt, measurement, x0y)
+                    x0hat_results = evaluator(gt, measurement, x0hat, reduction='none')
+                    x0y_results = evaluator(gt, measurement, x0y, reduction='none')
 
                 # record
                 if verbose:
                     main_eval_fn_name = evaluator.main_eval_fn_name
                     pbar.set_postfix({
-                        'x0hat' + '_' + main_eval_fn_name: f"{x0hat_results[main_eval_fn_name].item():.2f}",
-                        'x0y' + '_' + main_eval_fn_name: f"{x0y_results[main_eval_fn_name].item():.2f}",
+                        'x0hat' + '_' + main_eval_fn_name: f"{x0hat_results[main_eval_fn_name].mean().item():.2f}",
+                        'x0y' + '_' + main_eval_fn_name: f"{x0y_results[main_eval_fn_name].mean().item():.2f}",
                     })
-            if record:
+            if record or record_metrics:
                 self._record(xt, x0y, x0hat, sigma, x0hat_results, x0y_results)
         return xt
 
     def _record(self, xt, x0y, x0hat, sigma, x0hat_results, x0y_results):
         """Records the intermediate states during sampling."""
 
-        self.trajectory.add_tensor(f'xt', xt)
-        self.trajectory.add_tensor(f'x0y', x0y)
-        self.trajectory.add_tensor(f'x0hat', x0hat)
+        if self.record_tensors:
+            self.trajectory.add_tensor(f'xt', xt)
+            self.trajectory.add_tensor(f'x0y', x0y)
+            self.trajectory.add_tensor(f'x0hat', x0hat)
         self.trajectory.add_value(f'sigma', sigma)
         for name in x0hat_results.keys():
             self.trajectory.add_value(f'x0hat_{name}', x0hat_results[name])
@@ -141,7 +143,7 @@ class LatentDAPS(DAPS):
 
     Implements posterior sampling using a latent diffusion model combined with MCMC updates
     """
-    def sample(self, model, z_start, operator, measurement, evaluator=None, record=False, verbose=False, **kwargs):
+    def sample(self, model, z_start, operator, measurement, evaluator=None, record=False, record_metrics=False, verbose=False, **kwargs):
         """
         Performs sampling using LatentDAPS in latent space, decoding intermediate results.
 
@@ -159,8 +161,9 @@ class LatentDAPS(DAPS):
         Returns:
             torch.Tensor: Final sampled data decoded from latent space.
         """
-        if record:
+        if record or record_metrics:
             self.trajectory = Trajectory()
+        self.record_tensors = record
         pbar = tqdm.trange(self.annealing_scheduler.num_steps - 1) if verbose else range(self.annealing_scheduler.num_steps - 1)
         warpped_operator = LatentWrapper(operator, model)
 
@@ -192,17 +195,16 @@ class LatentDAPS(DAPS):
             if evaluator and 'gt' in kwargs:
                 with torch.no_grad():
                     gt = kwargs['gt']
-                    x0hat_results = evaluator(gt, measurement, x0hat)
-                    x0y_results = evaluator(gt, measurement, x0y)
+                    x0hat_results = evaluator(gt, measurement, x0hat, reduction='none')
+                    x0y_results = evaluator(gt, measurement, x0y, reduction='none')
 
                 # record
                 if verbose:
                     main_eval_fn_name = evaluator.main_eval_fn_name
                     pbar.set_postfix({
-                        'x0hat' + '_' + main_eval_fn_name: f"{x0hat_results[main_eval_fn_name].item():.2f}",
-                        'x0y' + '_' + main_eval_fn_name: f"{x0y_results[main_eval_fn_name].item():.2f}",
+                        'x0hat' + '_' + main_eval_fn_name: f"{x0hat_results[main_eval_fn_name].mean().item():.2f}",
+                        'x0y' + '_' + main_eval_fn_name: f"{x0y_results[main_eval_fn_name].mean().item():.2f}",
                     })
-            if record:
+            if record or record_metrics:
                 self._record(xt, x0y, x0hat, sigma, x0hat_results, x0y_results)
         return xt
-

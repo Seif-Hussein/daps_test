@@ -117,7 +117,7 @@ def save_mp4_video(gt, y, x0hat_traj, x0y_traj, xt_traj, output_path, fps=24, se
     writer.close()
 
 
-def sample_in_batch(sampler, model, x_start, operator, y, evaluator, verbose, record, batch_size, gt, args, root, run_id):
+def sample_in_batch(sampler, model, x_start, operator, y, evaluator, verbose, record, record_metrics, batch_size, gt, args, root, run_id):
     """
         posterior sampling in batch
     """
@@ -128,10 +128,20 @@ def sample_in_batch(sampler, model, x_start, operator, y, evaluator, verbose, re
         cur_x_start = x_start[s:s + batch_size]
         cur_y = y[s:s + batch_size]
         cur_gt = gt[s: s + batch_size]
-        cur_samples = sampler.sample(model, cur_x_start, operator, cur_y, evaluator, verbose=verbose, record=record, gt=cur_gt)
+        cur_samples = sampler.sample(
+            model,
+            cur_x_start,
+            operator,
+            cur_y,
+            evaluator,
+            verbose=verbose,
+            record=record,
+            record_metrics=record_metrics,
+            gt=cur_gt,
+        )
 
         samples.append(cur_samples)
-        if record:
+        if record or record_metrics:
             cur_trajs = sampler.trajectory.compile()
             trajs.append(cur_trajs)
 
@@ -162,9 +172,71 @@ def sample_in_batch(sampler, model, x_start, operator, y, evaluator, verbose, re
                 traj_grid_path = str(traj_dir / '{:05d}_run{:04d}.png'.format(idx+s, run_id))
                 save_image(selected_traj_grid * 0.5 + 0.5, fp=traj_grid_path, nrow=len(slices))
         
-    if record:
+    if record or record_metrics:
         trajs = Trajectory.merge(trajs)
+    else:
+        trajs = None
     return torch.cat(samples, dim=0), trajs
+
+
+def summarize_metric_trajectory(traj):
+    sigma = traj.value_data['sigma']
+    if sigma.ndim > 1:
+        sigma = sigma[:, 0]
+
+    summary = {
+        'num_iterations': int(len(sigma)),
+        'iteration': list(range(int(len(sigma)))),
+        'sigma': sigma.tolist(),
+        'x0hat': {},
+        'x0y': {},
+    }
+
+    for state_name in ['x0hat', 'x0y']:
+        prefix = f'{state_name}_'
+        metric_names = sorted(name[len(prefix):] for name in traj.value_data.keys() if name.startswith(prefix))
+        for metric_name in metric_names:
+            values = traj.value_data[f'{prefix}{metric_name}']
+            if values.ndim == 1:
+                values = values[:, None]
+            summary[state_name][metric_name] = {
+                'mean': values.mean(dim=1).tolist(),
+                'std': (values.std(dim=1) if values.shape[1] != 1 else torch.zeros(values.shape[0])).tolist(),
+                'min': values.min(dim=1).values.tolist(),
+                'max': values.max(dim=1).values.tolist(),
+            }
+    return summary
+
+
+def summarize_metric_trajectories(trajs):
+    run_summaries = [summarize_metric_trajectory(traj) for traj in trajs]
+    summary = {'runs': run_summaries}
+
+    if len(run_summaries) == 1:
+        summary['aggregate_across_runs'] = run_summaries[0]
+        return summary
+
+    aggregate = {
+        'num_iterations': run_summaries[0]['num_iterations'],
+        'iteration': run_summaries[0]['iteration'],
+        'sigma': run_summaries[0]['sigma'],
+        'x0hat': {},
+        'x0y': {},
+    }
+
+    for state_name in ['x0hat', 'x0y']:
+        metric_names = run_summaries[0][state_name].keys()
+        for metric_name in metric_names:
+            aggregate[state_name][metric_name] = {}
+            stat_names = run_summaries[0][state_name][metric_name].keys()
+            for stat_name in stat_names:
+                stat_values = np.array([run[state_name][metric_name][stat_name] for run in run_summaries])
+                aggregate[state_name][metric_name][stat_name] = stat_values.mean(axis=0).tolist()
+                if stat_name == 'mean':
+                    aggregate[state_name][metric_name]['std_across_runs'] = stat_values.std(axis=0).tolist()
+
+    summary['aggregate_across_runs'] = aggregate
+    return summary
 
 
 @hydra.main(version_base='1.3', config_path='configs', config_name='default.yaml')
@@ -223,13 +295,29 @@ def main(args):
     # main sampling process
     full_samples = []
     full_trajs = []
+    record_metrics = args.save_evolution_metrics
     for r in range(args.num_runs):
         print(f'Run: {r}')
         x_start = sampler.get_start(images.shape[0], model)
-        samples, trajs = sample_in_batch(sampler, model, x_start, operator, y, evaluator, verbose=True, record=args.save_traj, 
-                                         batch_size=args.batch_size, gt=images, args=args, root=root, run_id=r)
+        samples, trajs = sample_in_batch(
+            sampler,
+            model,
+            x_start,
+            operator,
+            y,
+            evaluator,
+            verbose=True,
+            record=args.save_traj,
+            record_metrics=record_metrics,
+            batch_size=args.batch_size,
+            gt=images,
+            args=args,
+            root=root,
+            run_id=r,
+        )
         full_samples.append(samples)
-        full_trajs.append(trajs)
+        if trajs is not None:
+            full_trajs.append(trajs)
     full_samples = torch.stack(full_samples, dim=0)
 
     # evaluate and log metrics
@@ -241,6 +329,10 @@ def main(args):
         file.write(markdown_text)
     json.dump(results, open(str(root / 'metrics.json'), 'w'), indent=4)
     print(markdown_text)
+
+    if args.save_evolution_metrics:
+        evolution_metrics = summarize_metric_trajectories(full_trajs)
+        json.dump(evolution_metrics, open(str(root / 'metrics_evolution.json'), 'w'), indent=4)
 
     # log grid results
     resized_y = resize(y, images, args.task[args.task_group].operator.name)

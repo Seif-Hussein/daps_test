@@ -8,6 +8,7 @@ save_samples: True
 save_traj: True
 save_traj_video: False
 save_traj_raw_data: False
+save_evolution_metrics: True
 show_eval: False
 eval_fid: False
 eval_fn_list: ['psnr', 'ssim', 'lpips']
