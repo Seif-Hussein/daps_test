@@ -38,6 +38,7 @@ class DAPS(nn.Module):
         self.annealing_scheduler = get_diffusion_scheduler(**annealing_scheduler_config)
         self.diffusion_scheduler_config = diffusion_scheduler_config
         self.mcmc_sampler = MCMCSampler(**mcmc_sampler_config)
+        self.progress_callback = None
 
     def sample(self, model, x_start, operator, measurement, evaluator=None, record=False, record_metrics=False, verbose=False, **kwargs):
         """
@@ -96,6 +97,14 @@ class DAPS(nn.Module):
                     })
             if record or record_metrics:
                 self._record(xt, x0y, x0hat, sigma, x0hat_results, x0y_results)
+            if self.progress_callback is not None:
+                self.progress_callback({
+                    'step': step,
+                    'num_steps': self.annealing_scheduler.num_steps - 1,
+                    'sigma': sigma,
+                    'x0hat_results': x0hat_results,
+                    'x0y_results': x0y_results,
+                })
         return xt
 
     def _record(self, xt, x0y, x0hat, sigma, x0hat_results, x0y_results):
@@ -207,4 +216,12 @@ class LatentDAPS(DAPS):
                     })
             if record or record_metrics:
                 self._record(xt, x0y, x0hat, sigma, x0hat_results, x0y_results)
+            if self.progress_callback is not None:
+                self.progress_callback({
+                    'step': step,
+                    'num_steps': self.annealing_scheduler.num_steps - 1,
+                    'sigma': sigma,
+                    'x0hat_results': x0hat_results,
+                    'x0y_results': x0y_results,
+                })
         return xt

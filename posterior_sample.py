@@ -18,6 +18,7 @@ import numpy as np
 import imageio
 
 import os
+from datetime import datetime, timezone
 
 try:
     import wandb
@@ -55,6 +56,77 @@ def safe_dir(dir):
     if not Path(dir).exists():
         Path(dir).mkdir()
     return Path(dir)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def to_python_scalar(x):
+    if torch.is_tensor(x):
+        x = x.detach().cpu()
+        if x.numel() == 1:
+            return x.item()
+        return x.tolist()
+    if isinstance(x, np.generic):
+        return x.item()
+    return x
+
+
+def write_json(path, data):
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + '.tmp')
+    with open(tmp_path, 'w') as file:
+        json.dump(data, file, indent=4)
+    tmp_path.replace(path)
+
+
+def build_progress_state(
+    *,
+    args,
+    total_images,
+    run_id,
+    num_runs,
+    step,
+    num_steps,
+    batch_start,
+    batch_end,
+    sigma=None,
+    x0hat_results=None,
+    x0y_results=None,
+    status='running',
+    message=None,
+):
+    progress = {
+        'status': status,
+        'message': message,
+        'updated_at': now_iso(),
+        'run_id': run_id,
+        'num_runs': num_runs,
+        'step': step,
+        'num_steps': num_steps,
+        'batch_start': batch_start,
+        'batch_end': batch_end,
+        'batch_size': batch_end - batch_start,
+        'total_images': total_images,
+        'task_name': args.task[args.task_group].operator.name,
+        'run_name': args.name,
+    }
+    if sigma is not None:
+        progress['sigma'] = to_python_scalar(sigma)
+
+    for state_name, results in [('x0hat', x0hat_results), ('x0y', x0y_results)]:
+        if results:
+            progress[state_name] = {}
+            for metric_name, metric_value in results.items():
+                metric_value = metric_value.detach().cpu()
+                progress[state_name][metric_name] = {
+                    'mean': metric_value.mean().item(),
+                    'std': metric_value.std().item() if metric_value.numel() > 1 else 0.0,
+                    'min': metric_value.min().item(),
+                    'max': metric_value.max().item(),
+                }
+    return progress
 
 
 def norm(x):
@@ -117,7 +189,23 @@ def save_mp4_video(gt, y, x0hat_traj, x0y_traj, xt_traj, output_path, fps=24, se
     writer.close()
 
 
-def sample_in_batch(sampler, model, x_start, operator, y, evaluator, verbose, record, record_metrics, batch_size, gt, args, root, run_id):
+def sample_in_batch(
+    sampler,
+    model,
+    x_start,
+    operator,
+    y,
+    evaluator,
+    verbose,
+    record,
+    record_metrics,
+    batch_size,
+    gt,
+    args,
+    root,
+    run_id,
+    progress_path=None,
+):
     """
         posterior sampling in batch
     """
@@ -128,6 +216,25 @@ def sample_in_batch(sampler, model, x_start, operator, y, evaluator, verbose, re
         cur_x_start = x_start[s:s + batch_size]
         cur_y = y[s:s + batch_size]
         cur_gt = gt[s: s + batch_size]
+        sampler.progress_callback = None
+        if progress_path is not None:
+            def progress_callback(payload, batch_start=s, batch_end=min(s + batch_size, len(x_start))):
+                progress_state = build_progress_state(
+                    args=args,
+                    total_images=len(x_start),
+                    run_id=run_id,
+                    num_runs=args.num_runs,
+                    step=payload['step'],
+                    num_steps=payload['num_steps'],
+                    batch_start=batch_start,
+                    batch_end=batch_end,
+                    sigma=payload['sigma'],
+                    x0hat_results=payload.get('x0hat_results'),
+                    x0y_results=payload.get('x0y_results'),
+                    status='running',
+                )
+                write_json(progress_path, progress_state)
+            sampler.progress_callback = progress_callback
         cur_samples = sampler.sample(
             model,
             cur_x_start,
@@ -278,8 +385,18 @@ def main(args):
     os.makedirs(args.save_dir, exist_ok=True)
     save_dir = safe_dir(Path(args.save_dir))
     root = safe_dir(save_dir / args.name)
+    progress_path = root / 'progress.json'
     with open(str(root / 'config.yaml'), 'w') as file:
         yaml.safe_dump(OmegaConf.to_container(args, resolve=True), file, default_flow_style=False, allow_unicode=True)
+    write_json(progress_path, {
+        'status': 'initialized',
+        'message': 'Starting run',
+        'updated_at': now_iso(),
+        'run_name': args.name,
+        'num_runs': args.num_runs,
+        'total_images': total_number,
+        'task_name': args.task[args.task_group].operator.name,
+    })
 
     # logging to wandb
     if args.wandb:
@@ -314,6 +431,7 @@ def main(args):
             args=args,
             root=root,
             run_id=r,
+            progress_path=progress_path,
         )
         full_samples.append(samples)
         if trajs is not None:
@@ -379,6 +497,17 @@ def main(args):
         if args.wandb:
             wandb.log({'FID': fid_score.item()})
 
+    write_json(progress_path, {
+        'status': 'completed',
+        'message': f'finish {args.name}!',
+        'updated_at': now_iso(),
+        'run_name': args.name,
+        'num_runs': args.num_runs,
+        'total_images': total_number,
+        'task_name': args.task[args.task_group].operator.name,
+        'metrics_path': str(root / 'metrics.json'),
+        'metrics_evolution_path': str(root / 'metrics_evolution.json'),
+    })
     print(f'finish {args.name}!')
 
 
