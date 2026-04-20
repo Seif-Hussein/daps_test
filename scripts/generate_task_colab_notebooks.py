@@ -81,7 +81,7 @@ def build_intro(task):
         "- clones the repo locally into `/content/DAPS-main`\n",
         "- still mounts Google Drive for dataset access\n",
         "- uses the dataset from Google Drive at `/content/drive/MyDrive/mycode/test-ffhq`\n",
-        "- runs all PNGs in that folder by default\n",
+        "- runs the first 100 PNGs in that folder by default\n",
         f"- uses the paper-style per-run step budget for this task: `{task['diffusion_steps']}` ODE / diffusion steps and `{task['annealing_steps']}` annealing steps\n",
         "- saves final metrics to `metrics.json`\n",
         "- saves per-iteration average PSNR / SSIM / LPIPS trajectories to `metrics_evolution.json`\n",
@@ -103,7 +103,11 @@ def main():
         cell5 = replace_setting(cell5, "DIFFUSION_STEPS = 10", f"DIFFUSION_STEPS = {task['diffusion_steps']}")
         cell5 = replace_setting(cell5, "ANNEALING_STEPS = 400", f"ANNEALING_STEPS = {task['annealing_steps']}")
         cell5 = replace_setting(cell5, "BATCH_SIZE = 10", "BATCH_SIZE = 100")
-        cell5 = replace_setting(cell5, 'DATA_ROOT = "dataset/demo-ffhq"', 'DRIVE_FFHQ_DATA_DIR = "/content/drive/MyDrive/mycode/test-ffhq"\nDATA_ROOT = DRIVE_FFHQ_DATA_DIR')
+        cell5 = replace_setting(
+            cell5,
+            'DRIVE_FFHQ_DATA_DIR = "/content/drive/MyDrive/mycode/test-ffhq"\nDATA_ROOT = DRIVE_FFHQ_DATA_DIR',
+            'DRIVE_FFHQ_DATA_DIR = "/content/drive/MyDrive/mycode/test-ffhq"\nDATA_ROOT = DRIVE_FFHQ_DATA_DIR',
+        )
         cell5 = replace_setting(
             cell5,
             'RUN_NAME = f"phase_retrieval_4k_10x400_ffhq100_benchmark"',
