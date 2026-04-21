@@ -34,6 +34,44 @@ from utils.save import save_result
 torch.set_printoptions(sci_mode=False)
 
 
+def _extract_info_list(info, key, length):
+    if not isinstance(info, dict) or key not in info:
+        return None
+
+    value = info[key]
+    if torch.is_tensor(value):
+        return value.view(-1).detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.reshape(-1).tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value] * length
+
+
+def _build_per_image_metric_entries(info, psnr, ssim, lpips):
+    batch_size = int(psnr.shape[0])
+    indices = _extract_info_list(info, "index", batch_size)
+    names = _extract_info_list(info, "name", batch_size)
+    class_ids = _extract_info_list(info, "class_id", batch_size)
+
+    entries = []
+    for i in range(batch_size):
+        item = {
+            "position_in_batch": i,
+            "psnr": float(psnr[i].item()),
+            "ssim": float(ssim[i].item()),
+            "lpips": float(lpips[i].item()),
+        }
+        if indices is not None:
+            item["index"] = int(indices[i])
+        if names is not None:
+            item["name"] = str(names[i])
+        if class_ids is not None:
+            item["class_id"] = str(class_ids[i])
+        entries.append(item)
+    return entries
+
+
 def main(cfg):
     print('cfg.exp.seed', cfg.exp.seed)
     print(cfg)
@@ -272,6 +310,12 @@ def main(cfg):
                     batch_psnr = psnrs[-1].mean().item()
                     batch_ssim = ssims[-1].mean().item()
                     batch_lpips = lpips_scores[-1].mean().item()
+                    image_metrics = _build_per_image_metric_entries(
+                        info=info,
+                        psnr=psnrs[-1],
+                        ssim=ssims[-1],
+                        lpips=lpips_scores[-1],
+                    )
                     metric_history_entries.append(
                         {
                             "batch_index": int(it),
@@ -287,6 +331,7 @@ def main(cfg):
                             "mean_ssim": None if mean_ssim is None else float(mean_ssim),
                             "mean_lpips": None if mean_lpips is None else float(mean_lpips),
                             "current_indices": current_indices,
+                            "images": image_metrics,
                         }
                     )
                     write_json_file(
