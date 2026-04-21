@@ -199,11 +199,11 @@ def main(cfg):
                 xx = torch.cat((xt_vis, mu_fft_abs, mu_fft_ang), dim=2)
                 save_result(dataset_name, xx, y, info, samples_root, "evol")
 
-            target = postprocess(x).detach()
+            target = postprocess(x).detach().clamp(0.0, 1.0)
             if isinstance(xt_s, list):
-                xo_metric = postprocess(xt_s[0]).detach().to(x.device)
+                xo_metric = postprocess(xt_s[0]).detach().to(x.device).clamp(0.0, 1.0)
             else:
-                xo_metric = postprocess(xt_s).detach().to(x.device)
+                xo_metric = postprocess(xt_s).detach().to(x.device).clamp(0.0, 1.0)
             xo = xo_metric.cpu()
 
             save_result(dataset_name, xo, y, info, samples_root, "")
