@@ -28,7 +28,7 @@ from models.diffusion import Diffusion
 from utils.distributed import get_logger, init_processes, common_init
 from utils.functions import get_timesteps, postprocess, preprocess, strfdt
 from utils.degredations import get_degreadation_image
-from utils.progress import write_progress_json
+from utils.progress import write_json_file, write_progress_json
 from utils.save import save_result
 
 torch.set_printoptions(sci_mode=False)
@@ -52,6 +52,9 @@ def main(cfg):
     progress_filename = getattr(cfg.exp, "progress_json", "progress.json")
     progress_path = os.path.join(samples_root, progress_filename)
     write_progress = bool(getattr(cfg.exp, "write_progress_json", True))
+    metric_history_filename = getattr(cfg.exp, "metrics_history_json", "metrics_history.json")
+    metric_history_path = os.path.join(samples_root, metric_history_filename)
+    write_metric_history = bool(getattr(cfg.exp, "write_metrics_history_json", True))
     run_started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     dataset_name = cfg.dataset.name
     if dist.get_rank() == 0:
@@ -73,6 +76,7 @@ def main(cfg):
                     "inverse_problem": cfg.algo.deg,
                     "seed": int(cfg.exp.seed),
                     "samples_root": samples_root,
+                    "metric_history_path": metric_history_path,
                     "started_at": run_started_at,
                 },
             )
@@ -92,6 +96,9 @@ def main(cfg):
         H = algo.H
 
     psnrs = []
+    ssims = []
+    lpips_scores = []
+    metric_history_entries = []
     start_time = time.time()
     dataset_size = len(loader.dataset)
     planned_batches = len(loader)
@@ -100,6 +107,15 @@ def main(cfg):
     planned_images = min(dataset_size, planned_batches * cfg.loader.batch_size)
     completed_batches = 0
     completed_images = 0
+    lpips_metric = None
+    if write_metric_history:
+        from torchmetrics.functional import structural_similarity_index_measure
+        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+        lpips_metric = LearnedPerceptualImagePatchSimilarity(normalize=True, reduction="none")
+        if torch.cuda.is_available():
+            lpips_metric = lpips_metric.cuda()
+        lpips_metric.eval()
 
     if dist.get_rank() == 0 and write_progress:
         write_progress_json(
@@ -112,6 +128,7 @@ def main(cfg):
                 "inverse_problem": cfg.algo.deg,
                 "seed": int(cfg.exp.seed),
                 "samples_root": samples_root,
+                "metric_history_path": metric_history_path,
                 "dataset_size": int(dataset_size),
                 "planned_batches": int(planned_batches),
                 "planned_images": int(planned_images),
@@ -122,7 +139,24 @@ def main(cfg):
                 "elapsed_sec": 0.0,
                 "eta_sec": None,
                 "mean_psnr": None,
+                "mean_ssim": None,
+                "mean_lpips": None,
                 "started_at": run_started_at,
+            },
+        )
+    if dist.get_rank() == 0 and write_metric_history:
+        write_json_file(
+            metric_history_path,
+            {
+                "status": "running",
+                "experiment_name": exp_name,
+                "dataset_name": dataset_name,
+                "algorithm": cfg.algo.name,
+                "inverse_problem": cfg.algo.deg,
+                "seed": int(cfg.exp.seed),
+                "samples_root": samples_root,
+                "started_at": run_started_at,
+                "entries": [],
             },
         )
 
@@ -165,24 +199,33 @@ def main(cfg):
                 xx = torch.cat((xt_vis, mu_fft_abs, mu_fft_ang), dim=2)
                 save_result(dataset_name, xx, y, info, samples_root, "evol")
 
+            target = postprocess(x).detach()
             if isinstance(xt_s, list):
-                xo = postprocess(xt_s[0]).cpu()
+                xo_metric = postprocess(xt_s[0]).detach().to(x.device)
             else:
-                xo = postprocess(xt_s).cpu()
+                xo_metric = postprocess(xt_s).detach().to(x.device)
+            xo = xo_metric.cpu()
 
             save_result(dataset_name, xo, y, info, samples_root, "")
 
-            mse = torch.mean((xo - postprocess(x).cpu()) ** 2, dim=(1, 2, 3))
+            mse = torch.mean((xo_metric - target) ** 2, dim=(1, 2, 3))
             psnr = 10 * torch.log10(1 / (mse + 1e-10))
-            psnrs.append(psnr)
+            psnrs.append(psnr.detach().cpu())
+            if write_metric_history:
+                ssim = structural_similarity_index_measure(
+                    xo_metric, target, reduction=None, data_range=1.0
+                ).detach().cpu()
+                with torch.no_grad():
+                    lpips_batch = lpips_metric(xo_metric, target).reshape(-1).detach().cpu()
+                ssims.append(ssim)
+                lpips_scores.append(lpips_batch)
 
             if cfg.exp.save_deg:
                 xo = postprocess(get_degreadation_image(y_0, H, cfg))
                 save_result(dataset_name, xo, y, info, samples_root, "deg")
 
             if cfg.exp.save_ori:
-                xo = postprocess(x)
-                save_result(dataset_name, xo, y, info, samples_root, "ori")
+                save_result(dataset_name, target.cpu(), y, info, samples_root, "ori")
 
             completed_batches = it + 1
             completed_images += n
@@ -193,6 +236,8 @@ def main(cfg):
                 if completed_batches > 0 and planned_batches > completed_batches:
                     eta_sec = ((planned_batches - completed_batches) / completed_batches) * elapsed_sec
                 mean_psnr = torch.cat(psnrs, dim=0).mean().item() if psnrs else None
+                mean_ssim = torch.cat(ssims, dim=0).mean().item() if ssims else None
+                mean_lpips = torch.cat(lpips_scores, dim=0).mean().item() if lpips_scores else None
                 current_indices = None
                 if isinstance(info, dict) and "index" in info:
                     current_indices = [int(v) for v in info["index"].view(-1).tolist()]
@@ -206,6 +251,7 @@ def main(cfg):
                         "inverse_problem": cfg.algo.deg,
                         "seed": int(cfg.exp.seed),
                         "samples_root": samples_root,
+                        "metric_history_path": metric_history_path,
                         "dataset_size": int(dataset_size),
                         "planned_batches": int(planned_batches),
                         "planned_images": int(planned_images),
@@ -217,9 +263,46 @@ def main(cfg):
                         "elapsed_sec": float(elapsed_sec),
                         "eta_sec": None if eta_sec is None else float(eta_sec),
                         "mean_psnr": None if mean_psnr is None else float(mean_psnr),
+                        "mean_ssim": None if mean_ssim is None else float(mean_ssim),
+                        "mean_lpips": None if mean_lpips is None else float(mean_lpips),
                         "started_at": run_started_at,
                     },
                 )
+                if write_metric_history:
+                    batch_psnr = psnrs[-1].mean().item()
+                    batch_ssim = ssims[-1].mean().item()
+                    batch_lpips = lpips_scores[-1].mean().item()
+                    metric_history_entries.append(
+                        {
+                            "batch_index": int(it),
+                            "batch_size": int(n),
+                            "completed_batches": int(completed_batches),
+                            "completed_images": int(completed_images),
+                            "elapsed_sec": float(elapsed_sec),
+                            "eta_sec": None if eta_sec is None else float(eta_sec),
+                            "batch_psnr": float(batch_psnr),
+                            "batch_ssim": float(batch_ssim),
+                            "batch_lpips": float(batch_lpips),
+                            "mean_psnr": None if mean_psnr is None else float(mean_psnr),
+                            "mean_ssim": None if mean_ssim is None else float(mean_ssim),
+                            "mean_lpips": None if mean_lpips is None else float(mean_lpips),
+                            "current_indices": current_indices,
+                        }
+                    )
+                    write_json_file(
+                        metric_history_path,
+                        {
+                            "status": "running",
+                            "experiment_name": exp_name,
+                            "dataset_name": dataset_name,
+                            "algorithm": cfg.algo.name,
+                            "inverse_problem": cfg.algo.deg,
+                            "seed": int(cfg.exp.seed),
+                            "samples_root": samples_root,
+                            "started_at": run_started_at,
+                            "entries": metric_history_entries,
+                        },
+                    )
 
             if it % cfg.exp.logfreq == 0 or cfg.exp.smoke_test > 0 or it < 10:
                 now = time.time() - start_time
@@ -229,10 +312,20 @@ def main(cfg):
                 logger.info(f"Iter {it}: {now_in_hours} has passed, expect to finish in {future_in_hours}")
 
         mean_psnr = None
+        mean_ssim = None
+        mean_lpips = None
         if len(psnrs) > 0:
             psnrs = torch.cat(psnrs, dim=0)
             mean_psnr = psnrs.mean().item()
             logger.info(f'PSNR: {mean_psnr}')
+        if len(ssims) > 0:
+            ssims = torch.cat(ssims, dim=0)
+            mean_ssim = ssims.mean().item()
+            logger.info(f'SSIM: {mean_ssim}')
+        if len(lpips_scores) > 0:
+            lpips_scores = torch.cat(lpips_scores, dim=0)
+            mean_lpips = lpips_scores.mean().item()
+            logger.info(f'LPIPS: {mean_lpips}')
 
         logger.info("Done.")
         now = time.time() - start_time
@@ -250,6 +343,7 @@ def main(cfg):
                     "inverse_problem": cfg.algo.deg,
                     "seed": int(cfg.exp.seed),
                     "samples_root": samples_root,
+                    "metric_history_path": metric_history_path,
                     "dataset_size": int(dataset_size),
                     "planned_batches": int(planned_batches),
                     "planned_images": int(planned_images),
@@ -260,8 +354,34 @@ def main(cfg):
                     "elapsed_sec": float(now),
                     "eta_sec": 0.0,
                     "mean_psnr": None if mean_psnr is None else float(mean_psnr),
+                    "mean_ssim": None if mean_ssim is None else float(mean_ssim),
+                    "mean_lpips": None if mean_lpips is None else float(mean_lpips),
                     "started_at": run_started_at,
                     "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+            )
+        if dist.get_rank() == 0 and write_metric_history:
+            write_json_file(
+                metric_history_path,
+                {
+                    "status": "completed",
+                    "experiment_name": exp_name,
+                    "dataset_name": dataset_name,
+                    "algorithm": cfg.algo.name,
+                    "inverse_problem": cfg.algo.deg,
+                    "seed": int(cfg.exp.seed),
+                    "samples_root": samples_root,
+                    "started_at": run_started_at,
+                    "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "summary": {
+                        "mean_psnr": None if mean_psnr is None else float(mean_psnr),
+                        "mean_ssim": None if mean_ssim is None else float(mean_ssim),
+                        "mean_lpips": None if mean_lpips is None else float(mean_lpips),
+                        "completed_batches": int(completed_batches),
+                        "completed_images": int(completed_images),
+                        "elapsed_sec": float(now),
+                    },
+                    "entries": metric_history_entries,
                 },
             )
     except Exception as exc:
@@ -276,16 +396,46 @@ def main(cfg):
                     "inverse_problem": cfg.algo.deg,
                     "seed": int(cfg.exp.seed),
                     "samples_root": samples_root,
+                    "metric_history_path": metric_history_path,
                     "dataset_size": int(dataset_size),
                     "planned_batches": int(planned_batches),
                     "planned_images": int(planned_images),
                     "completed_batches": int(completed_batches),
                     "completed_images": int(completed_images),
                     "elapsed_sec": float(time.time() - start_time),
+                    "mean_psnr": torch.cat(psnrs, dim=0).mean().item() if psnrs else None,
+                    "mean_ssim": torch.cat(ssims, dim=0).mean().item() if ssims else None,
+                    "mean_lpips": torch.cat(lpips_scores, dim=0).mean().item() if lpips_scores else None,
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
                     "started_at": run_started_at,
                     "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+            )
+        if dist.get_rank() == 0 and write_metric_history:
+            write_json_file(
+                metric_history_path,
+                {
+                    "status": "failed",
+                    "experiment_name": exp_name,
+                    "dataset_name": dataset_name,
+                    "algorithm": cfg.algo.name,
+                    "inverse_problem": cfg.algo.deg,
+                    "seed": int(cfg.exp.seed),
+                    "samples_root": samples_root,
+                    "started_at": run_started_at,
+                    "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "summary": {
+                        "mean_psnr": torch.cat(psnrs, dim=0).mean().item() if psnrs else None,
+                        "mean_ssim": torch.cat(ssims, dim=0).mean().item() if ssims else None,
+                        "mean_lpips": torch.cat(lpips_scores, dim=0).mean().item() if lpips_scores else None,
+                        "completed_batches": int(completed_batches),
+                        "completed_images": int(completed_images),
+                        "elapsed_sec": float(time.time() - start_time),
+                    },
+                    "entries": metric_history_entries,
                 },
             )
         raise
