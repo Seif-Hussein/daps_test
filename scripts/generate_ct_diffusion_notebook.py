@@ -311,21 +311,21 @@ if SAMPLER_CONFIG == "edm_pdhg":
     ])
 elif SAMPLER_CONFIG == "edm_dps":
     overrides.extend([
-        f"inverse_task.admm_config.dps.zeta_base={effective_dps_step_size}",
-        f"inverse_task.admm_config.dps.zeta_mode={effective_dps_zeta_mode}",
-        "inverse_task.admm_config.dps.zeta_min=0.0",
-        "inverse_task.admm_config.dps.zeta_max=1000000.0",
+        f"+inverse_task.admm_config.dps.zeta_base={effective_dps_step_size}",
+        f"+inverse_task.admm_config.dps.zeta_mode={effective_dps_zeta_mode}",
+        "+inverse_task.admm_config.dps.zeta_min=0.0",
+        "+inverse_task.admm_config.dps.zeta_max=1000000.0",
     ])
 elif SAMPLER_CONFIG == "edm_reddiff":
     overrides.extend([
-        f"inverse_task.admm_config.red_diff.lr={effective_reddiff_lr}",
-        f"inverse_task.admm_config.red_diff.obs_weight={effective_reddiff_meas_weight}",
-        f"inverse_task.admm_config.red_diff.noise_fit_weight={effective_reddiff_noise_weight}",
-        f"inverse_task.admm_config.red_diff.data_term={REDDIFF_DATA_TERM}",
-        f"inverse_task.admm_config.red_diff.init={REDDIFF_INIT_MODE}",
-        f"inverse_task.admm_config.red_diff.weight_type={REDDIFF_WEIGHT_TYPE}",
-        f"inverse_task.admm_config.red_diff.time_sampling={REDDIFF_TIME_SAMPLING}",
-        f"inverse_task.admm_config.red_diff.time_spacing={REDDIFF_TIME_SPACING}",
+        f"+inverse_task.admm_config.red_diff.lr={effective_reddiff_lr}",
+        f"+inverse_task.admm_config.red_diff.obs_weight={effective_reddiff_meas_weight}",
+        f"+inverse_task.admm_config.red_diff.noise_fit_weight={effective_reddiff_noise_weight}",
+        f"+inverse_task.admm_config.red_diff.data_term={REDDIFF_DATA_TERM}",
+        f"+inverse_task.admm_config.red_diff.init={REDDIFF_INIT_MODE}",
+        f"+inverse_task.admm_config.red_diff.weight_type={REDDIFF_WEIGHT_TYPE}",
+        f"+inverse_task.admm_config.red_diff.time_sampling={REDDIFF_TIME_SAMPLING}",
+        f"+inverse_task.admm_config.red_diff.time_spacing={REDDIFF_TIME_SPACING}",
     ])
 else:
     raise ValueError(f"Unsupported sampler config: {SAMPLER_CONFIG}")
