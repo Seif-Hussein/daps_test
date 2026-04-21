@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import hashlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +45,7 @@ By default it now keeps a fair native-count CT comparison across methods:
 - `PDHG`, `RED-diff`, and `DPS` all use the same count-domain transmission CT model
 - RED-diff gets count-aware pseudo-inverse initialization
 - DPS gets a count-domain likelihood-gradient step instead of comparing line integrals to counts
+- a shared-count cache can force native-count and DM4CT-style runs to reuse the exact same photon-count realization
 
 An opt-in DM4CT-style mode is still available for exploratory runs:
 
@@ -94,6 +96,7 @@ PYTHON_BIN = "/usr/bin/python3"  #@param {type:"string"}
 DRIVE_EXPORT_DIR = "/content/drive/MyDrive/ct_diffusion_single_run_exports"  #@param {type:"string"}
 DRIVE_CT_DATA_DIR = ""  #@param {type:"string"}
 DRIVE_CHECKPOINT_DIR = ""  #@param {type:"string"}
+DRIVE_MEASUREMENT_CACHE_DIR = ""  #@param {type:"string"}
 HF_MODEL_ID = "jiayangshi/lodochallenge_pixel_diffusion"  #@param {type:"string"}
 
 RUN_NAME = "CT_Diffusion_Single_Run"  #@param {type:"string"}
@@ -126,6 +129,7 @@ CT_OPERATOR_MODE = "native_counts"  #@param ["native_counts", "dm4ct_log", "auto
 CT_PREPROCESS_MODE = "current_percentile"  #@param ["current_percentile", "dm4ct_global", "explicit_minmax", "auto"]
 CT_VALUE_MIN = ""  #@param {type:"string"}
 CT_VALUE_MAX = ""  #@param {type:"string"}
+MEASUREMENT_MATCH_MODE = "shared_counts"  #@param ["shared_counts", "independent"]
 DM4CT_TRANSMITTANCE_RATE = 0.5  #@param {type:"number"}
 DM4CT_BAD_PIXEL_RATIO = 0.0  #@param {type:"number"}
 DM4CT_RING_SCALE = 0.25  #@param {type:"number"}
@@ -247,6 +251,7 @@ replace_once(
 
 native_operator_code = r'''
 import math
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -278,6 +283,7 @@ class TransmissionCTNative(Operator):
         pinv_relax=1.0,
         pinv_min=0.0,
         pinv_max=1.0,
+        measurement_cache_path="",
         device="cuda",
     ):
         super().__init__(sigma)
@@ -298,6 +304,7 @@ class TransmissionCTNative(Operator):
         self.pinv_relax = float(pinv_relax)
         self.pinv_min = float(pinv_min)
         self.pinv_max = float(pinv_max)
+        self.measurement_cache_path = str(measurement_cache_path) if measurement_cache_path is not None else ""
 
         angles = torch.arange(self.num_angles, dtype=torch.float32)
         angles = angles * (math.pi / max(1, self.num_angles))
@@ -305,6 +312,29 @@ class TransmissionCTNative(Operator):
         self.angles = angles
 
         self._sirt_cache = {}
+
+    def _cache_path(self):
+        if not self.measurement_cache_path:
+            return None
+        return Path(self.measurement_cache_path)
+
+    def _load_cached_counts(self, reference: torch.Tensor):
+        cache_path = self._cache_path()
+        if cache_path is None or not cache_path.exists():
+            return None
+        cached = torch.load(cache_path, map_location="cpu")
+        if tuple(cached.shape) != tuple(reference.shape):
+            raise RuntimeError(
+                f"Cached measurement shape {tuple(cached.shape)} does not match expected {tuple(reference.shape)}"
+            )
+        return cached.to(device=reference.device, dtype=reference.dtype)
+
+    def _save_cached_counts(self, counts: torch.Tensor):
+        cache_path = self._cache_path()
+        if cache_path is None:
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(counts.detach().cpu(), cache_path)
 
     def _angles_on(self, device, dtype):
         return self.angles.to(device=device, dtype=dtype)
@@ -409,7 +439,12 @@ class TransmissionCTNative(Operator):
 
     def measure(self, x):
         rate = self.mean_measurement(x).clamp_min(0.0).clamp_max(1.0e12)
-        return torch.poisson(rate)
+        cached = self._load_cached_counts(rate)
+        if cached is not None:
+            return cached
+        counts = torch.poisson(rate)
+        self._save_cached_counts(counts)
+        return counts
 
     def error(self, x, y):
         z = self(x)
@@ -492,6 +527,7 @@ print(f"Wrote {native_operator_path}")
 
 dm4ct_operator_code = r'''
 import math
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -527,6 +563,7 @@ class TransmissionCTDM4CT(Operator):
         pinv_relax=1.0,
         pinv_min=0.0,
         pinv_max=1.0,
+        measurement_cache_path="",
         device="cuda",
     ):
         super().__init__(sigma)
@@ -551,6 +588,7 @@ class TransmissionCTDM4CT(Operator):
         self.pinv_relax = float(pinv_relax)
         self.pinv_min = float(pinv_min)
         self.pinv_max = float(pinv_max)
+        self.measurement_cache_path = str(measurement_cache_path) if measurement_cache_path is not None else ""
 
         angles = torch.arange(self.num_angles, dtype=torch.float32)
         angles = angles * (math.pi / max(1, self.num_angles))
@@ -558,6 +596,29 @@ class TransmissionCTDM4CT(Operator):
         self.angles = angles
 
         self._sirt_cache = {}
+
+    def _cache_path(self):
+        if not self.measurement_cache_path:
+            return None
+        return Path(self.measurement_cache_path)
+
+    def _load_cached_counts(self, reference: torch.Tensor):
+        cache_path = self._cache_path()
+        if cache_path is None or not cache_path.exists():
+            return None
+        cached = torch.load(cache_path, map_location="cpu")
+        if tuple(cached.shape) != tuple(reference.shape):
+            raise RuntimeError(
+                f"Cached measurement shape {tuple(cached.shape)} does not match expected {tuple(reference.shape)}"
+            )
+        return cached.to(device=reference.device, dtype=reference.dtype)
+
+    def _save_cached_counts(self, counts: torch.Tensor):
+        cache_path = self._cache_path()
+        if cache_path is None:
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(counts.detach().cpu(), cache_path)
 
     def _angles_on(self, device, dtype):
         return self.angles.to(device=device, dtype=dtype)
@@ -662,6 +723,9 @@ class TransmissionCTDM4CT(Operator):
         scale = -math.log(target) / mean_sino
         return scale.reshape((-1,) + (1,) * (sinogram.dim() - 1))
 
+    def _native_count_rate(self, sinogram: torch.Tensor) -> torch.Tensor:
+        return self.incident_counts(sinogram) * torch.exp(-sinogram).clamp_min(0.0)
+
     def _apply_ring_artifacts(self, data: torch.Tensor) -> torch.Tensor:
         if self.bad_pixel_ratio <= 0.0 or self.ring_scale <= 0.0:
             return data
@@ -687,6 +751,18 @@ class TransmissionCTDM4CT(Operator):
 
     def measure(self, x):
         sinogram = self(x)
+        cache_path = self._cache_path()
+        cached_counts = self._load_cached_counts(sinogram)
+        if cached_counts is not None or cache_path is not None:
+            counts = cached_counts
+            if counts is None:
+                counts = torch.poisson(self._native_count_rate(sinogram).clamp(min=0.0, max=1.0e12))
+                self._save_cached_counts(counts)
+            counts = counts.clamp_min(1.0)
+            y = -torch.log((counts / self.incident_counts(sinogram)).clamp_min(1.0e-12))
+            y = self._apply_ring_artifacts(y)
+            return y
+
         scale = self._dm4ct_scale_factor(sinogram)
         scaled = sinogram * scale
         transmission = torch.exp((-scaled).clamp(min=-80.0, max=80.0))
@@ -822,6 +898,7 @@ else:
     code_cell(
         """#@title Build Run Command
 import json
+import hashlib
 import os
 import shlex
 from datetime import datetime
@@ -894,8 +971,28 @@ def _compute_ct_value_range(root: Path):
     return float(global_min), float(global_max), len(files)
 
 
+def _measurement_signature():
+    payload = {
+        "data_root": effective_data_root.as_posix(),
+        "data_start_idx": int(DATA_START_IDX),
+        "data_end_idx": int(DATA_END_IDX),
+        "total_images": int(TOTAL_IMAGES),
+        "seed": int(SEED),
+        "resolution": 512,
+        "num_angles": int(NUM_ANGLES),
+        "I0": float(I0),
+        "attenuation_min": 0.0,
+        "attenuation_max": 1.0,
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()[:16]
+
+
 effective_operator_mode = _resolve_effective_operator_mode()
 effective_preprocess_mode = _resolve_effective_preprocess_mode(effective_operator_mode)
+effective_measurement_match_mode = MEASUREMENT_MATCH_MODE.strip().lower()
+if effective_measurement_match_mode not in {"shared_counts", "independent"}:
+    raise ValueError(f"Unsupported MEASUREMENT_MATCH_MODE: {MEASUREMENT_MATCH_MODE}")
 
 effective_dps_step_size = float(DPS_STEP_SIZE)
 effective_dps_zeta_mode = DPS_ZETA_MODE
@@ -937,6 +1034,14 @@ elif effective_preprocess_mode == "explicit_minmax":
     effective_value_min = float(CT_VALUE_MIN)
     effective_value_max = float(CT_VALUE_MAX)
 
+measurement_cache_path = None
+measurement_signature = None
+if effective_measurement_match_mode == "shared_counts":
+    measurement_signature = _measurement_signature()
+    measurement_cache_root = Path(DRIVE_MEASUREMENT_CACHE_DIR) if DRIVE_MEASUREMENT_CACHE_DIR.strip() else Path(DRIVE_EXPORT_DIR) / "shared_measurements"
+    measurement_cache_root.mkdir(parents=True, exist_ok=True)
+    measurement_cache_path = measurement_cache_root / f"ct_counts_{measurement_signature}.pt"
+
 overrides = [
     f"seed={SEED}",
     f"name={RUN_NAME}",
@@ -968,6 +1073,8 @@ if effective_operator_mode == "dm4ct_log":
         f"+inverse_task.operator.pinv_method={DM4CT_PINV_METHOD}",
         f"+inverse_task.operator.pinv_iterations={DM4CT_PINV_ITERS}",
     ])
+    if measurement_cache_path is not None:
+        overrides.append(f"+inverse_task.operator.measurement_cache_path={measurement_cache_path.as_posix()}")
 else:
     overrides.extend([
         "inverse_task.operator.name=transmission_ct_native",
@@ -976,6 +1083,8 @@ else:
         f"+inverse_task.operator.pinv_method={DM4CT_PINV_METHOD}",
         f"+inverse_task.operator.pinv_iterations={DM4CT_PINV_ITERS}",
     ])
+    if measurement_cache_path is not None:
+        overrides.append(f"+inverse_task.operator.measurement_cache_path={measurement_cache_path.as_posix()}")
 
 if local_checkpoint_path:
     overrides.append(f"model.model_config.model_id={local_checkpoint_path}")
@@ -1047,6 +1156,9 @@ preset_summary = {
     "use_ct_benchmark_preset": bool(USE_CT_BENCHMARK_PRESET),
     "ct_operator_mode": effective_operator_mode,
     "ct_preprocess_mode": effective_preprocess_mode,
+    "measurement_match_mode": effective_measurement_match_mode,
+    "measurement_signature": measurement_signature,
+    "measurement_cache_path": measurement_cache_path.as_posix() if measurement_cache_path is not None else None,
     "ct_data_root": effective_data_root.as_posix(),
     "ct_value_min": effective_value_min,
     "ct_value_max": effective_value_max,
