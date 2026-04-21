@@ -879,6 +879,30 @@ def build_one_degredation_model(cfg, h, w, c, deg: str):
     deg = _normalize_deg_name(deg)
     if deg == "deno":
         H = Denoising(c, w, device)
+    elif deg in {"inpainting", "inpainting_box"}:
+        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
+        H = InpaintingOperatorH(
+            channels=c,
+            img_dim=w,
+            device=device,
+            sigma=operator_sigma,
+            mask_type="box",
+            mask_len_range=_cfg_or_default(operator_cfg, "mask_len_range", [128, 129]),
+            margin=_cfg_or_default(operator_cfg, "margin", [32, 32]),
+            box_start=_cfg_or_default(operator_cfg, "box_start", None),
+            box_mask_len=_cfg_or_default(operator_cfg, "box_mask_len", None),
+        )
+    elif deg in {"inpainting_rand", "inpainting_random"}:
+        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
+        H = InpaintingOperatorH(
+            channels=c,
+            img_dim=w,
+            device=device,
+            sigma=operator_sigma,
+            mask_type="random",
+            mask_prob_range=_cfg_or_default(operator_cfg, "mask_prob_range", [0.70, 0.71]),
+            margin=_cfg_or_default(operator_cfg, "margin", [32, 32]),
+        )
     elif deg[:3] == "inp":
         exp_root = cfg.exp.root
         deg_type = deg.split('_')[-1]
@@ -966,30 +990,6 @@ def build_one_degredation_model(cfg, h, w, c, deg: str):
             ),
             channels=c,
             img_dim=w,
-        )
-    elif deg in {"inpainting", "inpainting_box"}:
-        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
-        H = InpaintingOperatorH(
-            channels=c,
-            img_dim=w,
-            device=device,
-            sigma=operator_sigma,
-            mask_type="box",
-            mask_len_range=_cfg_or_default(operator_cfg, "mask_len_range", [128, 129]),
-            margin=_cfg_or_default(operator_cfg, "margin", [32, 32]),
-            box_start=_cfg_or_default(operator_cfg, "box_start", None),
-            box_mask_len=_cfg_or_default(operator_cfg, "box_mask_len", None),
-        )
-    elif deg in {"inpainting_rand", "inpainting_random"}:
-        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
-        H = InpaintingOperatorH(
-            channels=c,
-            img_dim=w,
-            device=device,
-            sigma=operator_sigma,
-            mask_type="random",
-            mask_prob_range=_cfg_or_default(operator_cfg, "mask_prob_range", [0.70, 0.71]),
-            margin=_cfg_or_default(operator_cfg, "margin", [32, 32]),
         )
     elif "bicubic" in deg:
         factor = int(deg[7:])
