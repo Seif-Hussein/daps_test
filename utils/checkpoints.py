@@ -23,7 +23,10 @@ URL_MAP = {
     "imagenet_256_classifier": "https://openaipublic.blob.core.windows.net/diffusion/jul-2021/256x256_classifier.pt",
     "imagenet_512_cond": "https://openaipublic.blob.core.windows.net/diffusion/jul-2021/512x512_diffusion.pt",
     "imagenet_512_classifier": "https://openaipublic.blob.core.windows.net/diffusion/jul-2021/512x512_classifier.pt",
-    "ffhq_256": "https://drive.google.com/uc?id=117Y6Z6-Hg6TMZVIXMmgYbpZy7QvTXign"
+    "ffhq_256": "https://drive.google.com/uc?id=1BGwhRWUoguF-D8wlZ65tf227gp3cDUDh"
+}
+GDOWN_ID_MAP = {
+    "ffhq_256": "1BGwhRWUoguF-D8wlZ65tf227gp3cDUDh",
 }
 CKPT_MAP = {
     "cifar10": "diffusion_cifar10_model/model-790000.ckpt",
@@ -53,10 +56,12 @@ MD5_MAP = {
 }
 
 
-def download(url, local_path, chunk_size=1024):
+def download(url, local_path, chunk_size=1024, gdrive_file_id=None):
     if dist.get_rank() == 0:
         os.makedirs(os.path.split(local_path)[0], exist_ok=True)
-        if 'drive.google.com' in url:
+        if gdrive_file_id is not None:
+            gdown.download(id=gdrive_file_id, output=local_path, quiet=False)
+        elif 'drive.google.com' in url:
             gdown.download(url, local_path, quiet=False, fuzzy=True)
         else:
             with requests.get(url, stream=True) as r:
@@ -90,7 +95,7 @@ def get_ckpt_path(name, root=None, check=False, prefix='exp'):
     path = os.path.join(root, CKPT_MAP[name])
     if not os.path.exists(path) or (check and not md5_hash(path) == MD5_MAP[name]):
         print("Downloading {} model from {} to {}".format(name, URL_MAP[name], path))
-        download(URL_MAP[name], path)
+        download(URL_MAP[name], path, gdrive_file_id=GDOWN_ID_MAP.get(name))
         md5 = md5_hash(path)
         assert md5 == MD5_MAP[name], md5
     return path
@@ -104,5 +109,5 @@ def ckpt_path_adm(name, cfg):
     os.makedirs(os.path.dirname(ckpt), exist_ok=True)
     if not os.path.exists(ckpt):
         logger.info(URL_MAP[name])
-        download(URL_MAP[name], ckpt)
+        download(URL_MAP[name], ckpt, gdrive_file_id=GDOWN_ID_MAP.get(name))
     return ckpt
