@@ -1,0 +1,13 @@
+# Local folder of user-supplied images.
+# Either use a flat folder:
+#   _data/custom_images/*.png
+# or ImageFolder layout:
+#   _data/custom_images/<class_name>/*.png
+name: "ImageNet_Custom_256x256"
+root: "_data/custom_images"
+split: "custom"
+image_size: 256
+channels: 3
+meta_root: ""
+transform: "diffusion"
+subset_txt: ""

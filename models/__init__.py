@@ -11,10 +11,13 @@ from utils.distributed import get_logger
 def build_model(cfg):
     logger = get_logger("model", cfg)
     model = call(cfg.model)
+    print(cfg.model)
+    #quit()
     map_location = {"cuda:0": f"cuda:{dist.get_rank()}"}
     model_ckpt = ckpt_path_adm(cfg.model.ckpt, cfg)
     logger.info(f"Loading model from {model_ckpt}..")
-    model.load_state_dict(torch.load(model_ckpt, map_location=map_location))
+    model.load_state_dict(torch.load(model_ckpt, map_location=map_location), strict=False)
+    print('asdas')
     classifier = call(cfg.classifier)
 
     if getattr(cfg.classifier, "ckpt", None):

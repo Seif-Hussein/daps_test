@@ -10,3 +10,16 @@ eta: 0.0
 mcg: False
 original: True
 lr: 0.25
+operator:
+  sigma: 0.05
+  scale_factor: 4
+  kernel_size: 61
+  gaussian_intensity: 3.0
+  motion_intensity: 0.5
+  oversample: 2.0
+  hdr_scale: 2.0
+  mask_len_range: [128, 129]
+  mask_prob_range: [0.70, 0.71]
+  margin: [32, 32]
+  box_start: null
+  box_mask_len: null

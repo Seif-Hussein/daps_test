@@ -4,8 +4,8 @@ import datetime
 import logging
 import os
 import shutil
-import sys
 import time
+import traceback
 from pathlib import Path
 
 import hydra
@@ -28,20 +28,18 @@ from models.diffusion import Diffusion
 from utils.distributed import get_logger, init_processes, common_init
 from utils.functions import get_timesteps, postprocess, preprocess, strfdt
 from utils.degredations import get_degreadation_image
+from utils.progress import write_progress_json
 from utils.save import save_result
 
 torch.set_printoptions(sci_mode=False)
 
-# import sys
-# sys.path.append('/lustre/fsw/nvresearch/mmardani/source/latent-diffusion-sampling/pgdm')
-# print(sys.path)
-#import pdb; pdb.set_trace()
-
 
 def main(cfg):
     print('cfg.exp.seed', cfg.exp.seed)
+    print(cfg)
     common_init(dist.get_rank(), seed=cfg.exp.seed)
-    torch.cuda.set_device(dist.get_rank())
+    if torch.cuda.is_available():
+        torch.cuda.set_device(dist.get_rank())
     
     # import pdb; pdb.set_trace()
     
@@ -51,6 +49,10 @@ def main(cfg):
     samples_root = cfg.exp.samples_root
     exp_name = cfg.exp.name
     samples_root = os.path.join(exp_root, samples_root, exp_name)
+    progress_filename = getattr(cfg.exp, "progress_json", "progress.json")
+    progress_path = os.path.join(samples_root, progress_filename)
+    write_progress = bool(getattr(cfg.exp, "write_progress_json", True))
+    run_started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     dataset_name = cfg.dataset.name
     if dist.get_rank() == 0:
         if cfg.exp.overwrite:
@@ -60,7 +62,20 @@ def main(cfg):
         else:
             if not os.path.exists(samples_root):
                 os.makedirs(samples_root)
-    
+        if write_progress:
+            write_progress_json(
+                progress_path,
+                {
+                    "status": "initializing",
+                    "experiment_name": exp_name,
+                    "dataset_name": dataset_name,
+                    "algorithm": cfg.algo.name,
+                    "inverse_problem": cfg.algo.deg,
+                    "seed": int(cfg.exp.seed),
+                    "samples_root": samples_root,
+                    "started_at": run_started_at,
+                },
+            )
 
             
     model, classifier = build_model(cfg)
@@ -78,102 +93,208 @@ def main(cfg):
 
     psnrs = []
     start_time = time.time()
-    for it, (x, y, info) in enumerate(loader):
-        
-        
-        if cfg.exp.smoke_test > 0 and it >= cfg.exp.smoke_test:
-            break
-        
+    dataset_size = len(loader.dataset)
+    planned_batches = len(loader)
+    if cfg.exp.smoke_test > 0:
+        planned_batches = min(planned_batches, cfg.exp.smoke_test)
+    planned_images = min(dataset_size, planned_batches * cfg.loader.batch_size)
+    completed_batches = 0
+    completed_images = 0
 
-        n, c, h, w = x.size()
-        x, y = x.cuda(), y.cuda()
+    if dist.get_rank() == 0 and write_progress:
+        write_progress_json(
+            progress_path,
+            {
+                "status": "running",
+                "experiment_name": exp_name,
+                "dataset_name": dataset_name,
+                "algorithm": cfg.algo.name,
+                "inverse_problem": cfg.algo.deg,
+                "seed": int(cfg.exp.seed),
+                "samples_root": samples_root,
+                "dataset_size": int(dataset_size),
+                "planned_batches": int(planned_batches),
+                "planned_images": int(planned_images),
+                "completed_batches": 0,
+                "completed_images": 0,
+                "current_batch_index": None,
+                "current_batch_size": 0,
+                "elapsed_sec": 0.0,
+                "eta_sec": None,
+                "mean_psnr": None,
+                "started_at": run_started_at,
+            },
+        )
 
-        x = preprocess(x)
-        ts = get_timesteps(cfg)
+    try:
+        for it, (x, y, info) in enumerate(loader):
+            if cfg.exp.smoke_test > 0 and it >= cfg.exp.smoke_test:
+                break
 
-        kwargs = info
-        if "ddrm" in cfg.algo.name or "mcg" in cfg.algo.name or "dps" in cfg.algo.name or "pgdm" in cfg.algo.name or "reddiff" in cfg.algo.name:
-            idx = info['index']
-            if 'inp' in cfg.algo.deg or 'in2' in cfg.algo.deg:   #what is in2?
-                H.set_indices(idx)
-            y_0 = H.H(x)
+            n, c, h, w = x.size()
+            x, y = x.cuda(), y.cuda()
 
-            # This is to account for scaling to [-1, 1]
-            y_0 = y_0 + torch.randn_like(y_0) * cfg.algo.sigma_y * 2    #?? what is it for???
-            kwargs["y_0"] = y_0
-        
-        
-        #pgdm
-        if cfg.exp.save_evolution:
-            xt_s, _, xt_vis, _, mu_fft_abs_s, mu_fft_ang_s = algo.sample(x, y, ts, **kwargs)   
-        else:    
-            xt_s, _ = algo.sample(x, y, ts, **kwargs)  
-        
-        #visualiztion of steps
-        if cfg.exp.save_evolution:
-            xt_vis = postprocess(xt_vis).cpu()
-            print('torch.max(mu_fft_abs_s)', torch.max(mu_fft_abs_s))
-            print('torch.min(mu_fft_abs_s)', torch.min(mu_fft_abs_s))
-            print('torch.max(mu_fft_ang_s)', torch.max(mu_fft_ang_s))
-            print('torch.min(mu_fft_ang_s)', torch.min(mu_fft_ang_s))
-            mu_fft_abs = torch.log(mu_fft_abs_s+1)
-            mu_fft_ang = mu_fft_ang_s  #torch.log10(mu_fft_abs_s+1)
-            mu_fft_abs = (mu_fft_abs - torch.min(mu_fft_abs))/(torch.max(mu_fft_abs) - torch.min(mu_fft_abs))
-            mu_fft_ang = (mu_fft_ang - torch.min(mu_fft_ang))/(torch.max(mu_fft_ang) - torch.min(mu_fft_ang))
-            xx = torch.cat((xt_vis, mu_fft_abs, mu_fft_ang), dim=2)
-            save_result(dataset_name, xx, y, info, samples_root, "evol")
-                    
-        #timing
-        # start_time_sample = time.time()
-        # finish_time_sample = time.time() - start_time
-        # print('cfg.loader.batch_size', cfg.loader.batch_size)
-        # print('cfg.exp.num_steps', cfg.exp.num_steps)
-        # time_per_sample = finish_time_sample/(cfg.exp.num_steps*cfg.loader.batch_size)
-        # print('time_per_sample', time_per_sample)
-        # import pdb; pdb.set_trace()
-        
-        
-        if isinstance(xt_s, list):
-            xo = postprocess(xt_s[0]).cpu()
-        else:
-            xo = postprocess(xt_s).cpu()
-        
-        save_result(dataset_name, xo, y, info, samples_root, "")
-        
-        mse = torch.mean((xo - postprocess(x).cpu()) ** 2, dim=(1, 2, 3))
-        psnr = 10 * torch.log10(1 / (mse + 1e-10))
-        psnrs.append(psnr)
+            x = preprocess(x)
+            ts = get_timesteps(cfg)
 
-        if cfg.exp.save_deg:
-            xo = postprocess(get_degreadation_image(y_0, H, cfg))
+            kwargs = info
+            if "ddrm" in cfg.algo.name or "mcg" in cfg.algo.name or "dps" in cfg.algo.name or "pgdm" in cfg.algo.name or "reddiff" in cfg.algo.name:
+                idx = info['index']
+                if 'inp' in cfg.algo.deg or 'in2' in cfg.algo.deg:   #what is in2?
+                    H.set_indices(idx)
+                y_0 = H.measure(x)
+                kwargs["y_0"] = y_0
 
-            save_result(dataset_name, xo, y, info, samples_root, "deg")
-        
-        if cfg.exp.save_ori:
-            xo = postprocess(x)
-            save_result(dataset_name, xo, y, info, samples_root, "ori")
+            #pgdm
+            if cfg.exp.save_evolution:
+                xt_s, _, xt_vis, _, mu_fft_abs_s, mu_fft_ang_s = algo.sample(x, y, ts, **kwargs)
+            else:
+                xt_s, _ = algo.sample(x, y, ts, **kwargs)
 
-        if it % cfg.exp.logfreq == 0 or cfg.exp.smoke_test > 0 or it < 10:
-            now = time.time() - start_time
-            now_in_hours = strfdt(datetime.timedelta(seconds=now))
-            future = (len(loader) - it - 1) / (it + 1) * now
-            future_in_hours = strfdt(datetime.timedelta(seconds=future))
-            logger.info(f"Iter {it}: {now_in_hours} has passed, expect to finish in {future_in_hours}")
-            
-            
-    if len(loader) > 0:
-        psnrs = torch.cat(psnrs, dim=0)
-        logger.info(f'PSNR: {psnrs.mean().item()}')
-        
-    logger.info("Done.")
-    now = time.time() - start_time
-    now_in_hours = strfdt(datetime.timedelta(seconds=now))
-    logger.info(f"Total time: {now_in_hours}")
+            #visualiztion of steps
+            if cfg.exp.save_evolution:
+                xt_vis = postprocess(xt_vis).cpu()
+                print('torch.max(mu_fft_abs_s)', torch.max(mu_fft_abs_s))
+                print('torch.min(mu_fft_abs_s)', torch.min(mu_fft_abs_s))
+                print('torch.max(mu_fft_ang_s)', torch.max(mu_fft_ang_s))
+                print('torch.min(mu_fft_ang_s)', torch.min(mu_fft_ang_s))
+                mu_fft_abs = torch.log(mu_fft_abs_s+1)
+                mu_fft_ang = mu_fft_ang_s  #torch.log10(mu_fft_abs_s+1)
+                mu_fft_abs = (mu_fft_abs - torch.min(mu_fft_abs))/(torch.max(mu_fft_abs) - torch.min(mu_fft_abs))
+                mu_fft_ang = (mu_fft_ang - torch.min(mu_fft_ang))/(torch.max(mu_fft_ang) - torch.min(mu_fft_ang))
+                xx = torch.cat((xt_vis, mu_fft_abs, mu_fft_ang), dim=2)
+                save_result(dataset_name, xx, y, info, samples_root, "evol")
+
+            if isinstance(xt_s, list):
+                xo = postprocess(xt_s[0]).cpu()
+            else:
+                xo = postprocess(xt_s).cpu()
+
+            save_result(dataset_name, xo, y, info, samples_root, "")
+
+            mse = torch.mean((xo - postprocess(x).cpu()) ** 2, dim=(1, 2, 3))
+            psnr = 10 * torch.log10(1 / (mse + 1e-10))
+            psnrs.append(psnr)
+
+            if cfg.exp.save_deg:
+                xo = postprocess(get_degreadation_image(y_0, H, cfg))
+                save_result(dataset_name, xo, y, info, samples_root, "deg")
+
+            if cfg.exp.save_ori:
+                xo = postprocess(x)
+                save_result(dataset_name, xo, y, info, samples_root, "ori")
+
+            completed_batches = it + 1
+            completed_images += n
+
+            if dist.get_rank() == 0 and write_progress:
+                elapsed_sec = time.time() - start_time
+                eta_sec = None
+                if completed_batches > 0 and planned_batches > completed_batches:
+                    eta_sec = ((planned_batches - completed_batches) / completed_batches) * elapsed_sec
+                mean_psnr = torch.cat(psnrs, dim=0).mean().item() if psnrs else None
+                current_indices = None
+                if isinstance(info, dict) and "index" in info:
+                    current_indices = [int(v) for v in info["index"].view(-1).tolist()]
+                write_progress_json(
+                    progress_path,
+                    {
+                        "status": "running",
+                        "experiment_name": exp_name,
+                        "dataset_name": dataset_name,
+                        "algorithm": cfg.algo.name,
+                        "inverse_problem": cfg.algo.deg,
+                        "seed": int(cfg.exp.seed),
+                        "samples_root": samples_root,
+                        "dataset_size": int(dataset_size),
+                        "planned_batches": int(planned_batches),
+                        "planned_images": int(planned_images),
+                        "completed_batches": int(completed_batches),
+                        "completed_images": int(completed_images),
+                        "current_batch_index": int(it),
+                        "current_batch_size": int(n),
+                        "current_indices": current_indices,
+                        "elapsed_sec": float(elapsed_sec),
+                        "eta_sec": None if eta_sec is None else float(eta_sec),
+                        "mean_psnr": None if mean_psnr is None else float(mean_psnr),
+                        "started_at": run_started_at,
+                    },
+                )
+
+            if it % cfg.exp.logfreq == 0 or cfg.exp.smoke_test > 0 or it < 10:
+                now = time.time() - start_time
+                now_in_hours = strfdt(datetime.timedelta(seconds=now))
+                future = (planned_batches - it - 1) / (it + 1) * now if planned_batches > 0 else 0
+                future_in_hours = strfdt(datetime.timedelta(seconds=future))
+                logger.info(f"Iter {it}: {now_in_hours} has passed, expect to finish in {future_in_hours}")
+
+        mean_psnr = None
+        if len(psnrs) > 0:
+            psnrs = torch.cat(psnrs, dim=0)
+            mean_psnr = psnrs.mean().item()
+            logger.info(f'PSNR: {mean_psnr}')
+
+        logger.info("Done.")
+        now = time.time() - start_time
+        now_in_hours = strfdt(datetime.timedelta(seconds=now))
+        logger.info(f"Total time: {now_in_hours}")
+
+        if dist.get_rank() == 0 and write_progress:
+            write_progress_json(
+                progress_path,
+                {
+                    "status": "completed",
+                    "experiment_name": exp_name,
+                    "dataset_name": dataset_name,
+                    "algorithm": cfg.algo.name,
+                    "inverse_problem": cfg.algo.deg,
+                    "seed": int(cfg.exp.seed),
+                    "samples_root": samples_root,
+                    "dataset_size": int(dataset_size),
+                    "planned_batches": int(planned_batches),
+                    "planned_images": int(planned_images),
+                    "completed_batches": int(completed_batches),
+                    "completed_images": int(completed_images),
+                    "current_batch_index": int(completed_batches - 1) if completed_batches > 0 else None,
+                    "current_batch_size": 0,
+                    "elapsed_sec": float(now),
+                    "eta_sec": 0.0,
+                    "mean_psnr": None if mean_psnr is None else float(mean_psnr),
+                    "started_at": run_started_at,
+                    "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+            )
+    except Exception as exc:
+        if dist.get_rank() == 0 and write_progress:
+            write_progress_json(
+                progress_path,
+                {
+                    "status": "failed",
+                    "experiment_name": exp_name,
+                    "dataset_name": dataset_name,
+                    "algorithm": cfg.algo.name,
+                    "inverse_problem": cfg.algo.deg,
+                    "seed": int(cfg.exp.seed),
+                    "samples_root": samples_root,
+                    "dataset_size": int(dataset_size),
+                    "planned_batches": int(planned_batches),
+                    "planned_images": int(planned_images),
+                    "completed_batches": int(completed_batches),
+                    "completed_images": int(completed_images),
+                    "elapsed_sec": float(time.time() - start_time),
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "started_at": run_started_at,
+                    "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+            )
+        raise
 
 
 @hydra.main(version_base="1.2", config_path="_configs", config_name="ddrmpp")
 def main_dist(cfg: DictConfig):
     cwd = HydraConfig.get().runtime.output_dir
+    print(cwd)
 
     if cfg.dist.num_processes_per_node < 0:
         size = torch.cuda.device_count()

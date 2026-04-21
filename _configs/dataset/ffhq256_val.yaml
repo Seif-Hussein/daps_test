@@ -1,9 +1,10 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved
 
 name: "FFHQ_256x256"
-root: "_data"
+root: "C:/Users/Seif/Desktop/reddiff/RED-diff/_data"
 split: "val"
 image_size: 256
 channels: 3
 transform: "default"
+meta_root: "C:/Users/Seif/Desktop/reddiff/RED-diff/_data"
 subset: 1000

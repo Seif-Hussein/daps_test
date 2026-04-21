@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved
 
-samples_root=/home/mmardani/research/stable-diffusion-sampling-gitlab/reddiff/_exp
+samples_root=C:/Users/Seif/Desktop/reddiff/RED-diff/_exp     #where to save data
 save_deg=True
 save_ori=True
 overwrite=True
@@ -8,9 +8,22 @@ smoke_test=1
 batch_size=1
 num_steps=10
 
+#samples_root=<root>/_exp
+model=ffhq_256  
+#-cn imagenet256_cond      #for conditional imagenent ckpt with classifier guidance
+algo=reddiff    
+deg=in2_20ff   
+num_steps=100    #number of diffusion steps
+sigma_y=0.0      #measurement noise std
+batch_size=10
+lambda=0.25
+lr=0.5
+dataset=ffhq256_val
+
+python   main.py  algo=$algo    algo.deg=$deg    exp.num_steps=$num_steps    algo.sigma_y=$sigma_y    loader.batch_size=$batch_size   loader=imagenet256_ddrm   dist.num_processes_per_node=1   exp.name=debug  exp.save_ori=True   exp.smoke_test=1  exp.samples_root=$samples_root   exp.save_evolution=True   algo.lr=$lr    algo.grad_term_weight=$lambda   model.ckpt=$model   dataset=$dataset
 
 #noisy inpaint + reddiff + adam
-python   main.py   exp.overwrite=True   algo=reddiff  exp.seed=1  algo.sigma_x0=0.0   algo.awd=True    algo.deg=in2_20ff     algo.lr=0.25   exp.num_steps=$num_steps    algo.sigma_y=0.1   loader.batch_size=$batch_size    loader=imagenet256_ddrmpp    dist.num_processes_per_node=1   exp.name=debug  exp.save_ori=$save_ori  exp.save_deg=$save_deg  exp.smoke_test=$smoke_test   exp.samples_root=$samples_root      exp.save_evolution=True     algo.grad_term_weight=1.0
+#python   main.py   exp.overwrite=True   algo=reddiff  exp.seed=1  algo.sigma_x0=0.0   algo.awd=True    algo.deg=in2_20ff     algo.lr=0.25   exp.num_steps=$num_steps    algo.sigma_y=0.   loader.batch_size=$batch_size    loader=imagenet256_ddrm    dist.num_processes_per_node=1   exp.name=debug  exp.save_ori=$save_ori  exp.save_deg=$save_deg  exp.smoke_test=$smoke_test   exp.samples_root=$samples_root      exp.save_evolution=True     algo.grad_term_weight=1.0
 
 #noisy inpaint + dps
 #tune eta 0.0 0.5 1.0

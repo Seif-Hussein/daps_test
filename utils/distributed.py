@@ -20,12 +20,15 @@ def init_processes(rank, size, fn, cfg, cwd):
         os.environ["MASTER_ADDR"] = cfg.dist.master_address
         os.environ["MASTER_PORT"] = str(cfg.dist.port)
         dist.init_process_group(backend=cfg.dist.backend, init_method="env://", rank=rank, world_size=size)
+        print(cfg)
         fn(cfg)
         dist.barrier()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
     except Exception:
         logging.error(traceback.format_exc())
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def common_init(rank, seed):

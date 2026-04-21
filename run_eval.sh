@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved
 
-root=/lustre/fsw/nvresearch/mmardani/output/latent-diffusion-sampling/pgdm
+root=C:/Users/Seif/Desktop/reddiff/RED-diff/_exp
 code=$root
 dataset=$SHARE_DATA/imagenet-root
 subset_txt=./misc/dgp_top1k.txt

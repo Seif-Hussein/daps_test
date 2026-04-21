@@ -7,6 +7,13 @@ from .jpeg_torch import jpeg_decode, jpeg_encode
 import yaml
 from torch.nn import functional as F
 
+from measurements.blur import GaussianBlur as MeasurementGaussianBlur
+from measurements.blur import MotionBlur as MeasurementMotionBlur
+from measurements.downsample import DownSampling as MeasurementDownSampling
+from measurements.hdr import HighDynamicRange as MeasurementHDR
+from measurements.inpainting import Inpainting as MeasurementInpainting
+from measurements.phaseretrieval import PhaseRetrieval as MeasurementPhaseRetrieval
+
 class H_functions:
     """
     A class replacing the SVD of a matrix H, perhaps efficiently.
@@ -77,6 +84,11 @@ class H_functions:
         temp[:, nonzero_idx] = temp[:, nonzero_idx] / singulars[nonzero_idx]
 
         return self.V(self.add_zeros(temp))
+
+    def measure(self, vec):
+        y0 = self.H(vec)
+        sigma = getattr(self, "sigma", 0.0)
+        return y0 + sigma * torch.randn_like(y0)
 
 
 # a memory inefficient implementation for any general degradation H
@@ -683,6 +695,159 @@ def load_mask(f):
     return m
 
 
+def _get_operator_cfg(cfg: DictConfig):
+    return getattr(cfg.algo, "operator", None)
+
+
+def _cfg_or_default(cfg, name, default):
+    if cfg is None:
+        return default
+    value = getattr(cfg, name, default)
+    return default if value is None else value
+
+
+def _normalize_deg_name(deg: str):
+    if deg.endswith("_explicit"):
+        return deg[: -len("_explicit")]
+    return deg
+
+
+def _to_pair(value):
+    if value is None:
+        return None
+    return tuple(int(v) for v in value)
+
+
+def _assign_default_sigma(H, sigma):
+    if not hasattr(H, "sigma") or H.sigma is None:
+        H.sigma = sigma
+    return H
+
+
+class OperatorH(H_functions):
+    """Adapter for forward operators that do not expose an analytical pseudo-inverse."""
+
+    def __init__(self, operator, channels, img_dim, pinv_fn=None):
+        self.operator = operator
+        self.channels = channels
+        self.img_dim = img_dim
+        self.sigma = getattr(operator, "sigma", 0.0)
+        self._pinv_fn = pinv_fn or (lambda x: x)
+
+    def H(self, image):
+        return self.operator(image)
+
+    def measure(self, image):
+        if hasattr(self.operator, "measure"):
+            return self.operator.measure(image)
+        return super().measure(image)
+
+    def H_pinv(self, x):
+        return self._pinv_fn(x)
+
+
+class DownSamplingOperatorH(OperatorH):
+    def __init__(self, channels, img_dim, scale_factor, device, sigma):
+        operator = MeasurementDownSampling(
+            resolution=img_dim,
+            scale_factor=scale_factor,
+            device=device,
+            sigma=sigma,
+            channels=channels,
+        )
+        self.scale_factor = scale_factor
+        super().__init__(operator=operator, channels=channels, img_dim=img_dim)
+
+    def H_pinv(self, x):
+        return F.interpolate(x, size=(self.img_dim, self.img_dim), mode="bicubic", align_corners=False)
+
+
+class PhaseRetrievalMeasurementH(OperatorH):
+    def __init__(self, channels, img_dim, oversample, sigma):
+        operator = MeasurementPhaseRetrieval(
+            oversample=oversample,
+            resolution=img_dim,
+            sigma=sigma,
+        )
+        self.oversample = oversample
+        super().__init__(operator=operator, channels=channels, img_dim=img_dim)
+
+    def H_pinv(self, x):
+        # Use the exact mycode2 forward operator and a zero-phase adjoint for initialization.
+        pseudo_spectrum = x.to(dtype=torch.complex64)
+        x01 = self.operator.adjoint_complex(pseudo_spectrum, out_hw=(self.img_dim, self.img_dim))
+        return (x01 * 2.0 - 1.0).clamp(-1.0, 1.0)
+
+
+class InpaintingOperatorH(H_functions):
+    """Deterministic inpainting wrapper that caches the sampled mask for the whole run."""
+
+    def __init__(
+        self,
+        channels,
+        img_dim,
+        device,
+        sigma,
+        mask_type,
+        mask_len_range=None,
+        mask_prob_range=None,
+        margin=(32, 32),
+        box_start=None,
+        box_mask_len=None,
+    ):
+        self.channels = channels
+        self.img_dim = img_dim
+        self.device = device
+        self.sigma = sigma
+        self.mask = None
+        self.explicit_box = None
+        box_start = _to_pair(box_start)
+        box_mask_len = _to_pair(box_mask_len)
+        if box_start is not None and box_mask_len is not None:
+            self.explicit_box = (box_start[0], box_start[1], box_mask_len[0], box_mask_len[1])
+            self.operator = None
+        else:
+            self.operator = MeasurementInpainting(
+                mask_type=mask_type,
+                mask_len_range=mask_len_range,
+                mask_prob_range=mask_prob_range,
+                resolution=img_dim,
+                device=device,
+                sigma=sigma,
+            )
+
+    def _ensure_mask(self, reference):
+        if self.mask is not None:
+            return self.mask.to(reference.device)
+
+        if self.explicit_box is not None:
+            top, left, height, width = self.explicit_box
+            mask = torch.ones(1, 1, self.img_dim, self.img_dim, device=reference.device)
+            mask[..., top : top + height, left : left + width] = 0
+            self.mask = mask
+            return self.mask
+
+        _ = self.operator(reference)
+        self.mask = self.operator.mask.to(reference.device)
+        return self.mask
+
+    def set_indices(self, idx):
+        # The mask is global for the run, matching the DAPS-style operator behavior.
+        return None
+
+    def H(self, image):
+        mask = self._ensure_mask(image)
+        return image * mask
+
+    def measure(self, image):
+        y0 = self.H(image)
+        return y0 + self.sigma * torch.randn_like(y0)
+
+    def H_pinv(self, x):
+        mask = self._ensure_mask(x)
+        return x * mask
+
+
 def build_degredation_model(cfg: DictConfig):
     print(cfg.algo)
     deg =  getattr(cfg.algo, "deg", "deno")   #'inp_20ff'   #dfault value deno
@@ -701,12 +866,17 @@ def build_degredation_model(cfg: DictConfig):
             if isinstance(H, SuperResolution) or isinstance(H, SRConv):
                 h = h // H.ratio
                 w = w // H.ratio
-        
-        return Compose(Hs)
+            elif isinstance(H, DownSamplingOperatorH):
+                h = h // H.scale_factor
+                w = w // H.scale_factor
+
+        return _assign_default_sigma(Compose(Hs), cfg.algo.sigma_y * 2)
 
 
 def build_one_degredation_model(cfg, h, w, c, deg: str):
     device = torch.device("cuda")
+    operator_cfg = _get_operator_cfg(cfg)
+    deg = _normalize_deg_name(deg)
     if deg == "deno":
         H = Denoising(c, w, device)
     elif deg[:3] == "inp":
@@ -747,6 +917,10 @@ def build_one_degredation_model(cfg, h, w, c, deg: str):
     elif deg[:2] == "sr":
         downsample_by = int(deg[2:])
         H = SuperResolution(c, w, downsample_by, device)
+    elif deg == "down_sampling":
+        scale_factor = int(_cfg_or_default(operator_cfg, "scale_factor", 4))
+        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
+        H = DownSamplingOperatorH(c, w, scale_factor=scale_factor, device=device, sigma=operator_sigma)
     elif deg == "color":
         H = Colorization(w, device)
     elif 'jpeg' in deg:
@@ -757,6 +931,66 @@ def build_one_degredation_model(cfg, h, w, c, deg: str):
         H = Quantization(qf)
     elif deg == 'hdr':
         H = HDR()
+    elif deg == "high_dynamic_range":
+        scale = _cfg_or_default(operator_cfg, "hdr_scale", 2.0)
+        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
+        H = OperatorH(
+            operator=MeasurementHDR(device=device, scale=scale, sigma=operator_sigma),
+            channels=c,
+            img_dim=w,
+        )
+    elif deg == "gaussian_blur":
+        kernel_size = int(_cfg_or_default(operator_cfg, "kernel_size", 61))
+        intensity = float(_cfg_or_default(operator_cfg, "gaussian_intensity", 3.0))
+        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
+        H = OperatorH(
+            operator=MeasurementGaussianBlur(
+                kernel_size=kernel_size,
+                intensity=intensity,
+                device=device,
+                sigma=operator_sigma,
+            ),
+            channels=c,
+            img_dim=w,
+        )
+    elif deg == "motion_blur":
+        kernel_size = int(_cfg_or_default(operator_cfg, "kernel_size", 61))
+        intensity = float(_cfg_or_default(operator_cfg, "motion_intensity", 0.5))
+        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
+        H = OperatorH(
+            operator=MeasurementMotionBlur(
+                kernel_size=kernel_size,
+                intensity=intensity,
+                device=device,
+                sigma=operator_sigma,
+            ),
+            channels=c,
+            img_dim=w,
+        )
+    elif deg in {"inpainting", "inpainting_box"}:
+        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
+        H = InpaintingOperatorH(
+            channels=c,
+            img_dim=w,
+            device=device,
+            sigma=operator_sigma,
+            mask_type="box",
+            mask_len_range=_cfg_or_default(operator_cfg, "mask_len_range", [128, 129]),
+            margin=_cfg_or_default(operator_cfg, "margin", [32, 32]),
+            box_start=_cfg_or_default(operator_cfg, "box_start", None),
+            box_mask_len=_cfg_or_default(operator_cfg, "box_mask_len", None),
+        )
+    elif deg in {"inpainting_rand", "inpainting_random"}:
+        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
+        H = InpaintingOperatorH(
+            channels=c,
+            img_dim=w,
+            device=device,
+            sigma=operator_sigma,
+            mask_type="random",
+            mask_prob_range=_cfg_or_default(operator_cfg, "mask_prob_range", [0.70, 0.71]),
+            margin=_cfg_or_default(operator_cfg, "margin", [32, 32]),
+        )
     elif "bicubic" in deg:
         factor = int(deg[7:])
         def bicubic_kernel(x, a=-0.5):
@@ -788,12 +1022,18 @@ def build_one_degredation_model(cfg, h, w, c, deg: str):
         print('opt_yml_path', opt_yml_path)
         H = NonlinearBlurOperator(device=device, opt_yml_path=opt_yml_path, current_dir=current_dir)
     elif deg == "phase_retrieval":
-        oversample=2.0
-        H = PhaseRetrievalOperator(oversample=oversample, device=device)
+        oversample = float(_cfg_or_default(operator_cfg, "oversample", 2.0))
+        operator_sigma = _cfg_or_default(operator_cfg, "sigma", cfg.algo.sigma_y)
+        H = PhaseRetrievalMeasurementH(
+            channels=c,
+            img_dim=w,
+            oversample=oversample,
+            sigma=operator_sigma,
+        )
     else:
         raise ValueError(f"Degredation model {deg} does not exist.")
 
-    return H
+    return _assign_default_sigma(H, cfg.algo.sigma_y * 2)
 
 
 def load_yaml(file_path: str) -> dict:
@@ -880,22 +1120,27 @@ from utils.fft_utils import fft2_m, ifft2_m
 
 #@register_operator(name='phase_retrieval')
 class PhaseRetrievalOperator(NonLinearOperator):
-    def __init__(self, oversample, device):
-        self.pad = int((oversample / 8.0) * 256)
+    def __init__(self, oversample, device, resolution=256, sigma=0.05):
+        self.pad = int((oversample / 8.0) * resolution)
         self.device = device
+        self.sigma = sigma
         
     def forward(self, data, **kwargs):
-        padded = F.pad(data, (self.pad, self.pad, self.pad, self.pad))
+        padded = F.pad(data * 0.5 + 0.5, (self.pad, self.pad, self.pad, self.pad))
         amplitude = fft2_m(padded).abs()
         return amplitude
     
     def H(self, data, **kwargs):
         return self.forward(data, **kwargs)
+
+    def measure(self, data, **kwargs):
+        y0 = self.H(data, **kwargs)
+        return y0 + self.sigma * torch.randn_like(y0)
     
     def H_pinv(self, x):
         x = ifft2_m(x).abs()
         x = self.undo_padding(x, self.pad, self.pad, self.pad, self.pad)
-        return x
+        return (x * 2.0 - 1.0).clamp(-1, 1)
     
     def undo_padding(self, tensor, pad_left, pad_right, pad_top, pad_bottom):
         # Assuming 'tensor' is the 4D tensor

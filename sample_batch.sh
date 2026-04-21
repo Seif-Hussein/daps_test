@@ -1,14 +1,14 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved
 
-root=<root>
+root=C:/Users/Seif/Desktop/reddiff/RED-diff/_exp
 
 ETA=1.0
 STEPS=1000
-MODEL=imagenet256
+MODEL=ffhq_256
 GRAD_WEIGHT=1.0
 
 
-samples_root=$root/_exp/samples     #where to save data
+samples_root=$root/samples     #where to save data
 save_deg=False
 save_ori=False
 overwrite=True
@@ -32,7 +32,7 @@ echo $ALGO
 echo $GRAD_WEIGHT
 
 #sample
-python   main.py   exp.overwrite=$overwrite   algo=$ALGO   algo.deg=$DEG    algo.eta=$ETA    exp.num_steps=$num_steps    algo.sigma_y=0.0   loader.batch_size=$batch_size    exp.seed=3    loader=imagenet256_ddrmpp    dist.num_processes_per_node=1   exp.name=$TARGET  exp.save_ori=$save_ori  exp.save_deg=$save_deg  exp.smoke_test=$smoke_test  exp.samples_root=$samples_root   algo.grad_term_weight=$GRAD_WEIGHT # algo.awd=True 
+python   main.py   exp.overwrite=$overwrite   algo=$ALGO   algo.deg=$DEG    algo.eta=$ETA    exp.num_steps=$num_steps    algo.sigma_y=0.0   loader.batch_size=$batch_size    exp.seed=3    loader=imagenet256_ddrm    dist.num_processes_per_node=1   exp.name=$TARGET  exp.save_ori=$save_ori  exp.save_deg=$save_deg  exp.smoke_test=$smoke_test  exp.samples_root=$samples_root   algo.grad_term_weight=$GRAD_WEIGHT # algo.awd=True 
 
 done
 done

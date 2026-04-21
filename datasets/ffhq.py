@@ -20,7 +20,13 @@ def get_ffhq_dataset(root, split, transform='default', subset=-1, **kwargs):
 def get_ffhq_loader(dset, *, batch_size, num_workers, shuffle, drop_last, pin_memory, **kwargs):
     sampler = DistributedSampler(dset, shuffle=shuffle, drop_last=drop_last)
     loader = DataLoader(
-        dset, num_workers=num_workers, batch_size=batch_size, shuffle=shuffle, sampler=sampler, pin_memory=pin_memory, persistent_workers=True
+        dset,
+        num_workers=num_workers,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        sampler=sampler,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
     )
     return loader
 

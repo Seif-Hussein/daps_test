@@ -1,0 +1,13 @@
+# Colab/Drive-friendly preset for user-supplied images.
+# The folder can either be flat:
+#   /content/drive/MyDrive/mycode/test-ffhq/*.png
+# or ImageFolder-style:
+#   /content/drive/MyDrive/mycode/test-ffhq/<class_name>/*.png
+name: "ImageNet_Drive_256x256"
+root: "${oc.env:DRIVE_FFHQ_DATA_DIR,/content/drive/MyDrive/mycode/test-ffhq}"
+split: "custom"
+image_size: 256
+channels: 3
+meta_root: ""
+transform: "diffusion"
+subset_txt: ""
