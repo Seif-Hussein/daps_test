@@ -39,6 +39,18 @@ This notebook mirrors `mycode2/notebooks/pdhg_ct_single_run_colab.ipynb`, but ad
 
 It keeps Colab as a thin launcher around the CT-capable `dyscode` pipeline and runs `recover_inverse2.py` with Hydra overrides.
 
+By default it now keeps a fair native-count CT comparison across methods:
+
+- `PDHG`, `RED-diff`, and `DPS` all use the same count-domain transmission CT model
+- RED-diff gets count-aware pseudo-inverse initialization
+- DPS gets a count-domain likelihood-gradient step instead of comparing line integrals to counts
+
+An opt-in DM4CT-style mode is still available for exploratory runs:
+
+- global min/max CT normalization
+- log-sinogram Poisson noiser with optional ring artifacts
+- pseudo-inverse initialization for CT
+
 Medical CT defaults taken from DM4CT Table 11:
 
 - DPS: step size `eta = 10`
@@ -48,10 +60,12 @@ Medical CT defaults taken from DM4CT Table 11:
 
 This launcher defaults to the same 80-angle noisy CT setup used by the original single-run CT notebook, so `REDDIFF_MEAS_WEIGHT` starts at `1.0`. If you want the clean 40-angle medical setting from the benchmark, set `REDDIFF_MEAS_WEIGHT = 0.5`.
 
-The notebook also applies a small post-clone patch so:
+The notebook also applies a post-clone patch so:
 
 - DPS uses its configured CT step size instead of a hardcoded clamp
 - RED-diff exposes separate CT measurement-consistency and noise-fit weights
+- a native-count CT operator with pseudo-inverse support is added for fair comparisons
+- a DM4CT-style CT operator is also available as an explicit alternate mode
 """,
         cell_id="title",
     ),
@@ -104,6 +118,21 @@ I0 = 10000.0  #@param {type:"number"}
 NUM_ANGLES = 80  #@param {type:"integer"}
 ADMM_LGVD_NUM_STEPS = 10  #@param {type:"integer"}
 
+# CT consistency mode:
+# - native_counts keeps all methods on the same count-domain transmission CT model
+# - dm4ct_log ports the DM4CT-style log-sinogram measurement path
+# - auto is kept for experimentation, but native_counts is the fair default
+CT_OPERATOR_MODE = "native_counts"  #@param ["native_counts", "dm4ct_log", "auto"]
+CT_PREPROCESS_MODE = "current_percentile"  #@param ["current_percentile", "dm4ct_global", "explicit_minmax", "auto"]
+CT_VALUE_MIN = ""  #@param {type:"string"}
+CT_VALUE_MAX = ""  #@param {type:"string"}
+DM4CT_TRANSMITTANCE_RATE = 0.5  #@param {type:"number"}
+DM4CT_BAD_PIXEL_RATIO = 0.0  #@param {type:"number"}
+DM4CT_RING_SCALE = 0.25  #@param {type:"number"}
+DM4CT_RING_SEED = 123  #@param {type:"integer"}
+DM4CT_PINV_METHOD = "sirt"  #@param ["sirt", "fbp", "backproject"]
+DM4CT_PINV_ITERS = 60  #@param {type:"integer"}
+
 # DM4CT Medical CT Table 11 gives DPS step size eta = 10.
 DPS_STEP_SIZE = 10.0  #@param {type:"number"}
 DPS_ZETA_MODE = "constant"  #@param ["constant", "residual_norm"]
@@ -119,9 +148,9 @@ REDDIFF_MEAS_WEIGHT = 1.0  #@param {type:"number"}
 REDDIFF_NOISE_WEIGHT = 10000.0  #@param {type:"number"}
 REDDIFF_TIME_SAMPLING = "descending"  #@param ["descending", "random"]
 REDDIFF_TIME_SPACING = "linear"  #@param ["linear", "log", "exp"]
-REDDIFF_WEIGHT_TYPE = "inv_snr"  #@param ["constant", "sigma", "sigma2", "inv_snr", "sqrt_inv_snr"]
+REDDIFF_WEIGHT_TYPE = "constant"  #@param ["constant", "sigma", "sigma2", "inv_snr", "sqrt_inv_snr"]
 REDDIFF_DATA_TERM = "nll"  #@param ["nll", "mse"]
-REDDIFF_INIT_MODE = "noise"  #@param ["noise", "random", "pinv", "measurement", "y"]
+REDDIFF_INIT_MODE = "pinv"  #@param ["noise", "random", "pinv", "measurement", "y"]
 
 EVAL_METRICS = "psnr;ssim"  #@param {type:"string"}
 SAVE_SAMPLES = True  #@param {type:"boolean"}
@@ -173,7 +202,7 @@ subprocess.run(["git", "status", "--short"], check=True)
 """
     ),
     code_cell(
-        """#@title Apply CT Sampler Compatibility Patches
+        """#@title Apply CT Sampler And Operator Patches
 import os
 from pathlib import Path
 
@@ -193,6 +222,11 @@ replace_once(
     "        self.zeta_min = 0.6\\n        self.zeta_max = 0.6\\n",
     "",
 )
+replace_once(
+    dps_path,
+    "                # Forward prediction and squared residual (no 1/(2*sigma_y^2) scaling;\\n                # matches Algorithm 1 / Eq. (21) in DPS paper).\\n                pred = operator(x0_hat)\\n                per_sample_sq, per_sample_norm = self._residual_sq_and_norm(operator, pred, measurement)\\n\\n                loss = per_sample_sq.sum()  # scalar\\n",
+    "                # Native count-domain CT needs a likelihood-consistent mismatch, since\\n                # operator(x0_hat) returns line integrals while the measurement stores counts.\\n                measurement_model = getattr(operator, 'measurement_model', None)\\n                if measurement_model == 'transmission_ct' or getattr(operator, 'name', None) in {'transmission_ct', 'transmission_ct_native'}:\\n                    per_sample_sq = operator.error(x0_hat, measurement)\\n                    per_sample_norm = (per_sample_sq + 1e-12).sqrt()\\n                else:\\n                    pred = operator(x0_hat)\\n                    per_sample_sq, per_sample_norm = self._residual_sq_and_norm(operator, pred, measurement)\\n\\n                loss = per_sample_sq.sum()  # scalar\\n",
+)
 
 reddiff_path = Path(REPO_DIR) / "sampler" / "reddiff.py"
 replace_once(
@@ -210,6 +244,547 @@ replace_once(
     "                    \\"RED-diff/data_loss\\": float(data_loss.item()),\\n",
     "                    \\"RED-diff/data_loss\\": float(data_loss.item()),\\n                    \\"RED-diff/obs_weight\\": float(self.obs_weight),\\n",
 )
+
+native_operator_code = r'''
+import math
+
+import torch
+import torch.nn.functional as F
+
+from .base import Operator
+from .registry import register_operator
+
+
+@register_operator(name="transmission_ct_native")
+class TransmissionCTNative(Operator):
+    measurement_model = "transmission_ct"
+
+    def __init__(
+        self,
+        resolution=512,
+        num_angles=60,
+        num_detectors=None,
+        angle_offset_deg=0.0,
+        detector_scale=1.0,
+        attenuation_min=0.0,
+        attenuation_max=1.0,
+        eta=1.0,
+        I0=1.0e4,
+        channels=1,
+        clamp_input=True,
+        sigma=1.0,
+        pinv_method="sirt",
+        pinv_iterations=60,
+        pinv_relax=1.0,
+        pinv_min=0.0,
+        pinv_max=1.0,
+        device="cuda",
+    ):
+        super().__init__(sigma)
+        self.resolution = int(resolution)
+        self.num_angles = int(num_angles)
+        self.num_detectors = int(num_detectors) if num_detectors is not None else int(resolution)
+        self.angle_offset_deg = float(angle_offset_deg)
+        self.detector_scale = float(detector_scale)
+        self.attenuation_min = float(attenuation_min)
+        self.attenuation_max = float(attenuation_max)
+        self.eta = float(eta)
+        self.I0 = float(I0)
+        self.channels = int(channels)
+        self.clamp_input = bool(clamp_input)
+        self.device = device
+        self.pinv_method = str(pinv_method).lower()
+        self.pinv_iterations = int(pinv_iterations)
+        self.pinv_relax = float(pinv_relax)
+        self.pinv_min = float(pinv_min)
+        self.pinv_max = float(pinv_max)
+
+        angles = torch.arange(self.num_angles, dtype=torch.float32)
+        angles = angles * (math.pi / max(1, self.num_angles))
+        angles = angles + math.radians(self.angle_offset_deg)
+        self.angles = angles
+
+        self._sirt_cache = {}
+
+    def _angles_on(self, device, dtype):
+        return self.angles.to(device=device, dtype=dtype)
+
+    def _attenuation_image(self, x: torch.Tensor) -> torch.Tensor:
+        x01 = (x + 1.0) * 0.5
+        if self.clamp_input:
+            x01 = x01.clamp(0.0, 1.0)
+        return self.attenuation_min + x01 * (self.attenuation_max - self.attenuation_min)
+
+    def _image_from_mu(self, mu: torch.Tensor) -> torch.Tensor:
+        denom = max(self.attenuation_max - self.attenuation_min, 1.0e-12)
+        x01 = (mu - self.attenuation_min) / denom
+        x = x01 * 2.0 - 1.0
+        return x.clamp(-1.0, 1.0)
+
+    @staticmethod
+    def _resize_detector_axis(sino: torch.Tensor, num_detectors: int) -> torch.Tensor:
+        if sino.shape[-1] == num_detectors:
+            return sino
+        b, c, a, d = sino.shape
+        flat = sino.reshape(b * c * a, 1, d)
+        flat = F.interpolate(flat, size=num_detectors, mode="linear", align_corners=False)
+        return flat.reshape(b, c, a, num_detectors)
+
+    def _forward_mu(self, mu: torch.Tensor) -> torch.Tensor:
+        if mu.dim() != 4:
+            raise ValueError(f"Expected [B,C,H,W] tensor, got {tuple(mu.shape)}")
+
+        b, c, h, w = mu.shape
+        if c != self.channels:
+            raise ValueError(f"Expected {self.channels} channels, got {c}")
+
+        angles = self._angles_on(mu.device, mu.dtype)
+        projections = []
+        dx = 2.0 / max(h, 1)
+
+        for angle in angles:
+            cos_a = torch.cos(angle)
+            sin_a = torch.sin(angle)
+            theta = torch.tensor(
+                [[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0]],
+                device=mu.device,
+                dtype=mu.dtype,
+            ).unsqueeze(0).expand(b, -1, -1)
+            grid = F.affine_grid(theta, mu.size(), align_corners=False)
+            rotated = F.grid_sample(mu, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+            proj = rotated.sum(dim=-2) * dx * self.detector_scale
+            projections.append(proj)
+
+        sino = torch.stack(projections, dim=-2)
+        sino = self._resize_detector_axis(sino, self.num_detectors)
+        return sino
+
+    def _backproject_mu(self, sino: torch.Tensor, out_hw=None) -> torch.Tensor:
+        if sino.dim() != 4:
+            raise ValueError(f"Expected [B,C,A,W] tensor, got {tuple(sino.shape)}")
+
+        b, c, _, d = sino.shape
+        h = self.resolution if out_hw is None else int(out_hw[0])
+        w = self.resolution if out_hw is None else int(out_hw[1])
+        dx = 2.0 / max(h, 1)
+        sino = self._resize_detector_axis(sino, w)
+        angles = self._angles_on(sino.device, sino.dtype)
+
+        back = torch.zeros((b, c, h, w), device=sino.device, dtype=sino.dtype)
+        for idx, angle in enumerate(angles):
+            proj = sino[:, :, idx, :]
+            slab = proj.unsqueeze(-2).expand(b, c, h, w) * dx * self.detector_scale
+            cos_a = torch.cos(angle)
+            sin_a = torch.sin(angle)
+            theta = torch.tensor(
+                [[cos_a, sin_a, 0.0], [-sin_a, cos_a, 0.0]],
+                device=sino.device,
+                dtype=sino.dtype,
+            ).unsqueeze(0).expand(b, -1, -1)
+            grid = F.affine_grid(theta, slab.size(), align_corners=False)
+            back = back + F.grid_sample(slab, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        return back
+
+    def adjoint(self, p, x_like=None):
+        mu_grad = self._backproject_mu(p)
+        scale = 0.5 * (self.attenuation_max - self.attenuation_min)
+        return mu_grad * scale
+
+    def __call__(self, x):
+        mu = self._attenuation_image(x)
+        return self._forward_mu(mu)
+
+    def incident_counts(self, reference: torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(self.I0):
+            i0 = self.I0.to(device=reference.device, dtype=reference.dtype)
+        else:
+            i0 = torch.as_tensor(self.I0, device=reference.device, dtype=reference.dtype)
+        while i0.dim() < reference.dim():
+            i0 = i0.unsqueeze(0)
+        return torch.broadcast_to(i0, reference.shape)
+
+    def mean_measurement(self, x: torch.Tensor) -> torch.Tensor:
+        z = self(x)
+        return self.incident_counts(z) * torch.exp(-z).clamp_min(0.0)
+
+    def measure(self, x):
+        rate = self.mean_measurement(x).clamp_min(0.0).clamp_max(1.0e12)
+        return torch.poisson(rate)
+
+    def error(self, x, y):
+        z = self(x)
+        i0 = self.incident_counts(z)
+        return self.eta * (i0 * torch.exp(-z) + y * z).flatten(1).sum(-1)
+
+    def loss(self, x, y):
+        return self.error(x, y).sum()
+
+    def post_ml_op(self, x, y):
+        return x
+
+    def _ramp_filter(self, sino: torch.Tensor) -> torch.Tensor:
+        n = sino.shape[-1]
+        freq = torch.fft.rfftfreq(n, d=1.0).to(device=sino.device, dtype=sino.dtype)
+        filt = freq.reshape((1, 1, 1, -1))
+        spec = torch.fft.rfft(sino, dim=-1)
+        return torch.fft.irfft(spec * filt, n=n, dim=-1)
+
+    def _ensure_sirt_weights(self, device, dtype):
+        key = (str(device), str(dtype))
+        if key in self._sirt_cache:
+            return self._sirt_cache[key]
+
+        ones_mu = torch.ones((1, self.channels, self.resolution, self.resolution), device=device, dtype=dtype)
+        R = self._forward_mu(ones_mu)
+        R = torch.where(R > 1.0e-8, 1.0 / R, torch.zeros_like(R))
+
+        ones_sino = torch.ones((1, self.channels, self.num_angles, self.num_detectors), device=device, dtype=dtype)
+        C = self._backproject_mu(ones_sino)
+        C = torch.where(C > 1.0e-8, 1.0 / C, torch.zeros_like(C))
+
+        self._sirt_cache[key] = (R, C)
+        return R, C
+
+    def _counts_to_line_integrals(self, y_counts: torch.Tensor) -> torch.Tensor:
+        i0 = self.incident_counts(y_counts)
+        frac = (y_counts.clamp_min(1.0) / i0.clamp_min(1.0)).clamp(min=1.0e-12, max=1.0)
+        return -torch.log(frac)
+
+    def _pinv_backproject(self, measurement: torch.Tensor) -> torch.Tensor:
+        z = self._counts_to_line_integrals(measurement)
+        return self._backproject_mu(z) / max(self.num_angles, 1)
+
+    def _pinv_fbp(self, measurement: torch.Tensor) -> torch.Tensor:
+        z = self._counts_to_line_integrals(measurement)
+        filtered = self._ramp_filter(z)
+        recon = self._backproject_mu(filtered)
+        recon = recon * (math.pi / max(2 * self.num_angles, 1))
+        return recon
+
+    def _pinv_sirt(self, measurement: torch.Tensor) -> torch.Tensor:
+        z = self._counts_to_line_integrals(measurement)
+        mu = torch.zeros(
+            (measurement.shape[0], self.channels, self.resolution, self.resolution),
+            device=measurement.device,
+            dtype=measurement.dtype,
+        )
+        R, C = self._ensure_sirt_weights(measurement.device, measurement.dtype)
+        for _ in range(max(self.pinv_iterations, 1)):
+            residual = z - self._forward_mu(mu)
+            mu = mu + self.pinv_relax * (C * self._backproject_mu(R * residual))
+            mu = mu.clamp(min=self.pinv_min, max=self.pinv_max)
+        return mu
+
+    def pinv(self, measurement: torch.Tensor) -> torch.Tensor:
+        method = self.pinv_method
+        if method == "backproject":
+            mu = self._pinv_backproject(measurement)
+        elif method == "fbp":
+            mu = self._pinv_fbp(measurement)
+        else:
+            mu = self._pinv_sirt(measurement)
+        return self._image_from_mu(mu)
+'''
+
+native_operator_path = Path(REPO_DIR) / "measurements" / "transmission_ct_native.py"
+native_operator_path.write_text(native_operator_code, encoding="utf-8")
+print(f"Wrote {native_operator_path}")
+
+dm4ct_operator_code = r'''
+import math
+
+import torch
+import torch.nn.functional as F
+
+from .base import Operator
+from .registry import register_operator
+
+
+@register_operator(name="transmission_ct_dm4ct")
+class TransmissionCTDM4CT(Operator):
+    measurement_model = "linear_mse"
+
+    def __init__(
+        self,
+        resolution=512,
+        num_angles=60,
+        num_detectors=None,
+        angle_offset_deg=0.0,
+        detector_scale=1.0,
+        attenuation_min=0.0,
+        attenuation_max=1.0,
+        eta=1.0,
+        I0=1.0e4,
+        channels=1,
+        clamp_input=True,
+        sigma=1.0,
+        transmittance_rate=0.5,
+        bad_pixel_ratio=0.0,
+        ring_scale=0.0,
+        ring_seed=123,
+        pinv_method="sirt",
+        pinv_iterations=60,
+        pinv_relax=1.0,
+        pinv_min=0.0,
+        pinv_max=1.0,
+        device="cuda",
+    ):
+        super().__init__(sigma)
+        self.resolution = int(resolution)
+        self.num_angles = int(num_angles)
+        self.num_detectors = int(num_detectors) if num_detectors is not None else int(resolution)
+        self.angle_offset_deg = float(angle_offset_deg)
+        self.detector_scale = float(detector_scale)
+        self.attenuation_min = float(attenuation_min)
+        self.attenuation_max = float(attenuation_max)
+        self.eta = float(eta)
+        self.I0 = float(I0)
+        self.channels = int(channels)
+        self.clamp_input = bool(clamp_input)
+        self.device = device
+        self.transmittance_rate = float(transmittance_rate)
+        self.bad_pixel_ratio = float(bad_pixel_ratio)
+        self.ring_scale = float(ring_scale)
+        self.ring_seed = int(ring_seed)
+        self.pinv_method = str(pinv_method).lower()
+        self.pinv_iterations = int(pinv_iterations)
+        self.pinv_relax = float(pinv_relax)
+        self.pinv_min = float(pinv_min)
+        self.pinv_max = float(pinv_max)
+
+        angles = torch.arange(self.num_angles, dtype=torch.float32)
+        angles = angles * (math.pi / max(1, self.num_angles))
+        angles = angles + math.radians(self.angle_offset_deg)
+        self.angles = angles
+
+        self._sirt_cache = {}
+
+    def _angles_on(self, device, dtype):
+        return self.angles.to(device=device, dtype=dtype)
+
+    def _attenuation_image(self, x: torch.Tensor) -> torch.Tensor:
+        x01 = (x + 1.0) * 0.5
+        if self.clamp_input:
+            x01 = x01.clamp(0.0, 1.0)
+        return self.attenuation_min + x01 * (self.attenuation_max - self.attenuation_min)
+
+    def _image_from_mu(self, mu: torch.Tensor) -> torch.Tensor:
+        denom = max(self.attenuation_max - self.attenuation_min, 1.0e-12)
+        x01 = (mu - self.attenuation_min) / denom
+        x = x01 * 2.0 - 1.0
+        return x.clamp(-1.0, 1.0)
+
+    @staticmethod
+    def _resize_detector_axis(sino: torch.Tensor, num_detectors: int) -> torch.Tensor:
+        if sino.shape[-1] == num_detectors:
+            return sino
+        b, c, a, d = sino.shape
+        flat = sino.reshape(b * c * a, 1, d)
+        flat = F.interpolate(flat, size=num_detectors, mode="linear", align_corners=False)
+        return flat.reshape(b, c, a, num_detectors)
+
+    def _forward_mu(self, mu: torch.Tensor) -> torch.Tensor:
+        if mu.dim() != 4:
+            raise ValueError(f"Expected [B,C,H,W] tensor, got {tuple(mu.shape)}")
+
+        b, c, h, w = mu.shape
+        if c != self.channels:
+            raise ValueError(f"Expected {self.channels} channels, got {c}")
+
+        angles = self._angles_on(mu.device, mu.dtype)
+        projections = []
+        dx = 2.0 / max(h, 1)
+
+        for angle in angles:
+            cos_a = torch.cos(angle)
+            sin_a = torch.sin(angle)
+            theta = torch.tensor(
+                [[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0]],
+                device=mu.device,
+                dtype=mu.dtype,
+            ).unsqueeze(0).expand(b, -1, -1)
+            grid = F.affine_grid(theta, mu.size(), align_corners=False)
+            rotated = F.grid_sample(mu, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+            proj = rotated.sum(dim=-2) * dx * self.detector_scale
+            projections.append(proj)
+
+        sino = torch.stack(projections, dim=-2)
+        sino = self._resize_detector_axis(sino, self.num_detectors)
+        return sino
+
+    def _backproject_mu(self, sino: torch.Tensor, out_hw=None) -> torch.Tensor:
+        if sino.dim() != 4:
+            raise ValueError(f"Expected [B,C,A,W] tensor, got {tuple(sino.shape)}")
+
+        b, c, _, d = sino.shape
+        h = self.resolution if out_hw is None else int(out_hw[0])
+        w = self.resolution if out_hw is None else int(out_hw[1])
+        dx = 2.0 / max(h, 1)
+        sino = self._resize_detector_axis(sino, w)
+        angles = self._angles_on(sino.device, sino.dtype)
+
+        back = torch.zeros((b, c, h, w), device=sino.device, dtype=sino.dtype)
+        for idx, angle in enumerate(angles):
+            proj = sino[:, :, idx, :]
+            slab = proj.unsqueeze(-2).expand(b, c, h, w) * dx * self.detector_scale
+            cos_a = torch.cos(angle)
+            sin_a = torch.sin(angle)
+            theta = torch.tensor(
+                [[cos_a, sin_a, 0.0], [-sin_a, cos_a, 0.0]],
+                device=sino.device,
+                dtype=sino.dtype,
+            ).unsqueeze(0).expand(b, -1, -1)
+            grid = F.affine_grid(theta, slab.size(), align_corners=False)
+            back = back + F.grid_sample(slab, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        return back
+
+    def adjoint(self, p, x_like=None):
+        mu_grad = self._backproject_mu(p)
+        scale = 0.5 * (self.attenuation_max - self.attenuation_min)
+        return mu_grad * scale
+
+    def __call__(self, x):
+        mu = self._attenuation_image(x)
+        return self._forward_mu(mu)
+
+    def incident_counts(self, reference: torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(self.I0):
+            i0 = self.I0.to(device=reference.device, dtype=reference.dtype)
+        else:
+            i0 = torch.as_tensor(self.I0, device=reference.device, dtype=reference.dtype)
+        while i0.dim() < reference.dim():
+            i0 = i0.unsqueeze(0)
+        return torch.broadcast_to(i0, reference.shape)
+
+    def _dm4ct_scale_factor(self, sinogram: torch.Tensor) -> torch.Tensor:
+        target = max(self.transmittance_rate, 1.0e-6)
+        mean_sino = sinogram.reshape(sinogram.shape[0], -1).mean(dim=1).clamp_min(1.0e-8)
+        scale = -math.log(target) / mean_sino
+        return scale.reshape((-1,) + (1,) * (sinogram.dim() - 1))
+
+    def _apply_ring_artifacts(self, data: torch.Tensor) -> torch.Tensor:
+        if self.bad_pixel_ratio <= 0.0 or self.ring_scale <= 0.0:
+            return data
+
+        b = data.shape[0]
+        w = data.shape[-1]
+        cpu_gen = torch.Generator(device="cpu")
+        cpu_gen.manual_seed(self.ring_seed)
+
+        num_bad = int(b * w * self.bad_pixel_ratio)
+        mask = torch.zeros(b * w, dtype=data.dtype)
+        if num_bad > 0:
+            mask[:num_bad] = 1.0
+            perm = torch.randperm(b * w, generator=cpu_gen)
+            mask = mask[perm]
+        mask = mask.reshape(b, w).to(device=data.device, dtype=data.dtype)
+
+        noise = torch.randn((b, w), generator=cpu_gen, dtype=data.dtype).to(device=data.device, dtype=data.dtype)
+        data_std = data.reshape(b, -1).std(dim=1, unbiased=False).clamp_min(1.0e-8)
+        noise = noise * (self.ring_scale * data_std[:, None])
+
+        return data + noise[:, None, :] * mask[:, None, :]
+
+    def measure(self, x):
+        sinogram = self(x)
+        scale = self._dm4ct_scale_factor(sinogram)
+        scaled = sinogram * scale
+        transmission = torch.exp((-scaled).clamp(min=-80.0, max=80.0))
+        counts = torch.poisson((transmission * self.incident_counts(sinogram)).clamp(min=0.0, max=1.0e12))
+        counts = counts.clamp_min(1.0)
+        y = -torch.log((counts / self.incident_counts(sinogram)).clamp_min(1.0e-12))
+        y = y / scale
+        y = self._apply_ring_artifacts(y)
+        return y
+
+    def error(self, x, y):
+        return ((self(x) - y) ** 2).flatten(1).sum(-1)
+
+    def loss(self, x, y):
+        return 0.5 * self.error(x, y).sum()
+
+    def post_ml_op(self, x, y):
+        return x
+
+    def _ramp_filter(self, sino: torch.Tensor) -> torch.Tensor:
+        n = sino.shape[-1]
+        freq = torch.fft.rfftfreq(n, d=1.0).to(device=sino.device, dtype=sino.dtype)
+        filt = freq.reshape((1, 1, 1, -1))
+        spec = torch.fft.rfft(sino, dim=-1)
+        return torch.fft.irfft(spec * filt, n=n, dim=-1)
+
+    def _ensure_sirt_weights(self, device, dtype):
+        key = (str(device), str(dtype))
+        if key in self._sirt_cache:
+            return self._sirt_cache[key]
+
+        ones_mu = torch.ones((1, self.channels, self.resolution, self.resolution), device=device, dtype=dtype)
+        R = self._forward_mu(ones_mu)
+        R = torch.where(R > 1.0e-8, 1.0 / R, torch.zeros_like(R))
+
+        ones_sino = torch.ones((1, self.channels, self.num_angles, self.num_detectors), device=device, dtype=dtype)
+        C = self._backproject_mu(ones_sino)
+        C = torch.where(C > 1.0e-8, 1.0 / C, torch.zeros_like(C))
+
+        self._sirt_cache[key] = (R, C)
+        return R, C
+
+    def _pinv_backproject(self, measurement: torch.Tensor) -> torch.Tensor:
+        return self._backproject_mu(measurement) / max(self.num_angles, 1)
+
+    def _pinv_fbp(self, measurement: torch.Tensor) -> torch.Tensor:
+        filtered = self._ramp_filter(measurement)
+        recon = self._backproject_mu(filtered)
+        recon = recon * (math.pi / max(2 * self.num_angles, 1))
+        return recon
+
+    def _pinv_sirt(self, measurement: torch.Tensor) -> torch.Tensor:
+        mu = torch.zeros(
+            (measurement.shape[0], self.channels, self.resolution, self.resolution),
+            device=measurement.device,
+            dtype=measurement.dtype,
+        )
+        R, C = self._ensure_sirt_weights(measurement.device, measurement.dtype)
+        for _ in range(max(self.pinv_iterations, 1)):
+            residual = measurement - self._forward_mu(mu)
+            mu = mu + self.pinv_relax * (C * self._backproject_mu(R * residual))
+            mu = mu.clamp(min=self.pinv_min, max=self.pinv_max)
+        return mu
+
+    def pinv(self, measurement: torch.Tensor) -> torch.Tensor:
+        method = self.pinv_method
+        if method == "backproject":
+            mu = self._pinv_backproject(measurement)
+        elif method == "fbp":
+            mu = self._pinv_fbp(measurement)
+        else:
+            mu = self._pinv_sirt(measurement)
+        return self._image_from_mu(mu)
+'''
+
+dm4ct_operator_path = Path(REPO_DIR) / "measurements" / "transmission_ct_dm4ct.py"
+dm4ct_operator_path.write_text(dm4ct_operator_code, encoding="utf-8")
+print(f"Wrote {dm4ct_operator_path}")
+
+measurements_init_path = Path(REPO_DIR) / "measurements" / "__init__.py"
+measurements_init = measurements_init_path.read_text(encoding="utf-8")
+if "from .transmission_ct_native import TransmissionCTNative" not in measurements_init:
+    measurements_init = measurements_init.replace(
+        "from .transmission_ct import TransmissionCT\\n",
+        "from .transmission_ct import TransmissionCT\\nfrom .transmission_ct_native import TransmissionCTNative\\n",
+    )
+if "from .transmission_ct_dm4ct import TransmissionCTDM4CT" not in measurements_init:
+    measurements_init = measurements_init.replace(
+        "from .transmission_ct_native import TransmissionCTNative\\n",
+        "from .transmission_ct_native import TransmissionCTNative\\nfrom .transmission_ct_dm4ct import TransmissionCTDM4CT\\n",
+    )
+if "TransmissionCT, TransmissionCTNative, TransmissionCTDM4CT" not in measurements_init:
+    measurements_init = measurements_init.replace(
+        "TransmissionCT, DownSamplingExplicit",
+        "TransmissionCT, TransmissionCTNative, TransmissionCTDM4CT, DownSamplingExplicit",
+    )
+measurements_init_path.write_text(measurements_init, encoding="utf-8")
+print(f"Patched {measurements_init_path}")
 """
     ),
     code_cell(
@@ -252,6 +827,9 @@ import shlex
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 os.chdir(REPO_DIR)
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -264,11 +842,69 @@ run_aux_root = save_root / "run_aux"
 latest_log_path = run_aux_root / "run.log"
 latest_pid_path = run_aux_root / "run.pid"
 
+def _resolve_effective_operator_mode():
+    mode = CT_OPERATOR_MODE.strip().lower()
+    if mode == "auto":
+        return "native_counts" if SAMPLER_CONFIG == "edm_pdhg" else "dm4ct_log"
+    if mode not in {"native_counts", "dm4ct_log"}:
+        raise ValueError(f"Unsupported CT_OPERATOR_MODE: {CT_OPERATOR_MODE}")
+    return mode
+
+
+def _resolve_effective_preprocess_mode(operator_mode: str):
+    mode = CT_PREPROCESS_MODE.strip().lower()
+    if mode == "auto":
+        return "dm4ct_global" if operator_mode == "dm4ct_log" else "current_percentile"
+    if mode not in {"current_percentile", "dm4ct_global", "explicit_minmax"}:
+        raise ValueError(f"Unsupported CT_PREPROCESS_MODE: {CT_PREPROCESS_MODE}")
+    return mode
+
+
+def _load_ct_array(path: Path) -> np.ndarray:
+    suffix = path.suffix.lower()
+    if suffix in {".dcm", ".ima"}:
+        import pydicom
+
+        ds = pydicom.dcmread(path)
+        arr = ds.pixel_array.astype(np.float32)
+        slope = float(getattr(ds, "RescaleSlope", 1.0))
+        intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+        return arr * slope + intercept
+
+    arr = np.asarray(Image.open(path), dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return arr
+
+
+def _compute_ct_value_range(root: Path):
+    exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".dcm", ".ima"}
+    files = sorted([p for p in root.rglob("*") if p.suffix.lower() in exts])
+    if not files:
+        raise FileNotFoundError(f"No CT image files found under: {root}")
+
+    global_min = None
+    global_max = None
+    for path in files:
+        arr = _load_ct_array(path)
+        cur_min = float(np.nanmin(arr))
+        cur_max = float(np.nanmax(arr))
+        global_min = cur_min if global_min is None else min(global_min, cur_min)
+        global_max = cur_max if global_max is None else max(global_max, cur_max)
+    return float(global_min), float(global_max), len(files)
+
+
+effective_operator_mode = _resolve_effective_operator_mode()
+effective_preprocess_mode = _resolve_effective_preprocess_mode(effective_operator_mode)
+
 effective_dps_step_size = float(DPS_STEP_SIZE)
 effective_dps_zeta_mode = DPS_ZETA_MODE
 effective_reddiff_lr = float(REDDIFF_LR)
 effective_reddiff_meas_weight = float(REDDIFF_MEAS_WEIGHT)
 effective_reddiff_noise_weight = float(REDDIFF_NOISE_WEIGHT)
+effective_reddiff_data_term = REDDIFF_DATA_TERM
+effective_reddiff_init_mode = REDDIFF_INIT_MODE
+effective_reddiff_weight_type = REDDIFF_WEIGHT_TYPE
 
 if USE_CT_BENCHMARK_PRESET:
     if SAMPLER_CONFIG == "edm_dps":
@@ -277,6 +913,29 @@ if USE_CT_BENCHMARK_PRESET:
     elif SAMPLER_CONFIG == "edm_reddiff":
         effective_reddiff_lr = 0.01
         effective_reddiff_noise_weight = 1.0e4
+        if effective_operator_mode == "dm4ct_log":
+            effective_reddiff_data_term = "mse"
+            effective_reddiff_init_mode = "pinv"
+            effective_reddiff_weight_type = "constant"
+
+if effective_operator_mode == "dm4ct_log" and SAMPLER_CONFIG == "edm_reddiff" and effective_reddiff_data_term == "nll":
+    print("Switching RED-diff data term from nll to mse for dm4ct_log mode.")
+    effective_reddiff_data_term = "mse"
+
+effective_data_root = Path(DRIVE_CT_DATA_DIR) if DRIVE_CT_DATA_DIR.strip() else Path(REPO_DIR) / "demo-samples" / "ct_l067_subset"
+if DRIVE_CT_DATA_DIR.strip() and not effective_data_root.exists():
+    raise FileNotFoundError(f"CT data folder not found: {effective_data_root}")
+
+effective_value_min = None
+effective_value_max = None
+effective_value_scan_count = None
+if effective_preprocess_mode == "dm4ct_global":
+    effective_value_min, effective_value_max, effective_value_scan_count = _compute_ct_value_range(effective_data_root)
+elif effective_preprocess_mode == "explicit_minmax":
+    if not CT_VALUE_MIN.strip() or not CT_VALUE_MAX.strip():
+        raise ValueError("CT_VALUE_MIN and CT_VALUE_MAX must be provided for explicit_minmax mode.")
+    effective_value_min = float(CT_VALUE_MIN)
+    effective_value_max = float(CT_VALUE_MAX)
 
 overrides = [
     f"seed={SEED}",
@@ -294,10 +953,29 @@ overrides = [
     f"sampler.annealing_scheduler_config.sigma_max={SIGMA_MAX}",
     f"sampler.annealing_scheduler_config.sigma_min={SIGMA_MIN}",
     f"inverse_task.admm_config.max_iter={MAX_ITER}",
-    f"inverse_task.operator.I0={I0}",
-    f"inverse_task.operator.num_angles={NUM_ANGLES}",
     f"model.model_config.local_files_only={'true' if local_checkpoint_path else 'false'}",
 ]
+
+if effective_operator_mode == "dm4ct_log":
+    overrides.extend([
+        "inverse_task.operator.name=transmission_ct_dm4ct",
+        f"inverse_task.operator.I0={I0}",
+        f"inverse_task.operator.num_angles={NUM_ANGLES}",
+        f"+inverse_task.operator.transmittance_rate={DM4CT_TRANSMITTANCE_RATE}",
+        f"+inverse_task.operator.bad_pixel_ratio={DM4CT_BAD_PIXEL_RATIO}",
+        f"+inverse_task.operator.ring_scale={DM4CT_RING_SCALE}",
+        f"+inverse_task.operator.ring_seed={DM4CT_RING_SEED}",
+        f"+inverse_task.operator.pinv_method={DM4CT_PINV_METHOD}",
+        f"+inverse_task.operator.pinv_iterations={DM4CT_PINV_ITERS}",
+    ])
+else:
+    overrides.extend([
+        "inverse_task.operator.name=transmission_ct_native",
+        f"inverse_task.operator.I0={I0}",
+        f"inverse_task.operator.num_angles={NUM_ANGLES}",
+        f"+inverse_task.operator.pinv_method={DM4CT_PINV_METHOD}",
+        f"+inverse_task.operator.pinv_iterations={DM4CT_PINV_ITERS}",
+    ])
 
 if local_checkpoint_path:
     overrides.append(f"model.model_config.model_id={local_checkpoint_path}")
@@ -321,9 +999,9 @@ elif SAMPLER_CONFIG == "edm_reddiff":
         f"+inverse_task.admm_config.red_diff.lr={effective_reddiff_lr}",
         f"+inverse_task.admm_config.red_diff.obs_weight={effective_reddiff_meas_weight}",
         f"+inverse_task.admm_config.red_diff.noise_fit_weight={effective_reddiff_noise_weight}",
-        f"+inverse_task.admm_config.red_diff.data_term={REDDIFF_DATA_TERM}",
-        f"+inverse_task.admm_config.red_diff.init={REDDIFF_INIT_MODE}",
-        f"+inverse_task.admm_config.red_diff.weight_type={REDDIFF_WEIGHT_TYPE}",
+        f"+inverse_task.admm_config.red_diff.data_term={effective_reddiff_data_term}",
+        f"+inverse_task.admm_config.red_diff.init={effective_reddiff_init_mode}",
+        f"+inverse_task.admm_config.red_diff.weight_type={effective_reddiff_weight_type}",
         f"+inverse_task.admm_config.red_diff.time_sampling={REDDIFF_TIME_SAMPLING}",
         f"+inverse_task.admm_config.red_diff.time_spacing={REDDIFF_TIME_SPACING}",
     ])
@@ -334,11 +1012,8 @@ if CONFIG_NAME == "default_ct_admm.yaml":
     overrides.append(f"inverse_task.admm_config.denoise.lgvd.num_steps={ADMM_LGVD_NUM_STEPS}")
 
 if DRIVE_CT_DATA_DIR.strip():
-    drive_data_dir = Path(DRIVE_CT_DATA_DIR)
-    if not drive_data_dir.exists():
-        raise FileNotFoundError(f"CT data folder not found: {drive_data_dir}")
     overrides.extend([
-        f"data.image_root_path={drive_data_dir.as_posix()}",
+        f"data.image_root_path={effective_data_root.as_posix()}",
         f"data.start_idx={DATA_START_IDX}",
         f"data.end_idx={DATA_END_IDX}",
     ])
@@ -346,6 +1021,14 @@ else:
     overrides.extend([
         f"data.start_idx={DATA_START_IDX}",
         f"data.end_idx={DATA_END_IDX}",
+    ])
+
+if effective_preprocess_mode in {"dm4ct_global", "explicit_minmax"}:
+    overrides.extend([
+        f"+data.value_min={effective_value_min}",
+        f"+data.value_max={effective_value_max}",
+        "data.percentile_min=null",
+        "data.percentile_max=null",
     ])
 
 if EXTRA_HYDRA_OVERRIDES.strip():
@@ -362,11 +1045,25 @@ run_cmd = [
 preset_summary = {
     "sampler_config": SAMPLER_CONFIG,
     "use_ct_benchmark_preset": bool(USE_CT_BENCHMARK_PRESET),
+    "ct_operator_mode": effective_operator_mode,
+    "ct_preprocess_mode": effective_preprocess_mode,
+    "ct_data_root": effective_data_root.as_posix(),
+    "ct_value_min": effective_value_min,
+    "ct_value_max": effective_value_max,
+    "ct_value_scan_count": effective_value_scan_count,
+    "dm4ct_transmittance_rate": DM4CT_TRANSMITTANCE_RATE if effective_operator_mode == "dm4ct_log" else None,
+    "dm4ct_bad_pixel_ratio": DM4CT_BAD_PIXEL_RATIO if effective_operator_mode == "dm4ct_log" else None,
+    "dm4ct_ring_scale": DM4CT_RING_SCALE if effective_operator_mode == "dm4ct_log" else None,
+    "dm4ct_pinv_method": DM4CT_PINV_METHOD if effective_operator_mode == "dm4ct_log" else None,
+    "dm4ct_pinv_iters": DM4CT_PINV_ITERS if effective_operator_mode == "dm4ct_log" else None,
     "dps_step_size": effective_dps_step_size if SAMPLER_CONFIG == "edm_dps" else None,
     "dps_zeta_mode": effective_dps_zeta_mode if SAMPLER_CONFIG == "edm_dps" else None,
     "reddiff_lr": effective_reddiff_lr if SAMPLER_CONFIG == "edm_reddiff" else None,
     "reddiff_meas_weight": effective_reddiff_meas_weight if SAMPLER_CONFIG == "edm_reddiff" else None,
     "reddiff_noise_weight": effective_reddiff_noise_weight if SAMPLER_CONFIG == "edm_reddiff" else None,
+    "reddiff_data_term": effective_reddiff_data_term if SAMPLER_CONFIG == "edm_reddiff" else None,
+    "reddiff_init_mode": effective_reddiff_init_mode if SAMPLER_CONFIG == "edm_reddiff" else None,
+    "reddiff_weight_type": effective_reddiff_weight_type if SAMPLER_CONFIG == "edm_reddiff" else None,
 }
 print("Effective sampler settings:\\n")
 print(json.dumps(preset_summary, indent=2))
