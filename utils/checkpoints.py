@@ -23,7 +23,7 @@ URL_MAP = {
     "imagenet_256_classifier": "https://openaipublic.blob.core.windows.net/diffusion/jul-2021/256x256_classifier.pt",
     "imagenet_512_cond": "https://openaipublic.blob.core.windows.net/diffusion/jul-2021/512x512_diffusion.pt",
     "imagenet_512_classifier": "https://openaipublic.blob.core.windows.net/diffusion/jul-2021/512x512_classifier.pt",
-    "ffhq_256": "https://drive.google.com/uc\?id=117Y6Z6-Hg6TMZVIXMmgYbpZy7QvTXign"
+    "ffhq_256": "https://drive.google.com/uc?id=117Y6Z6-Hg6TMZVIXMmgYbpZy7QvTXign"
 }
 CKPT_MAP = {
     "cifar10": "diffusion_cifar10_model/model-790000.ckpt",
@@ -55,10 +55,10 @@ MD5_MAP = {
 
 def download(url, local_path, chunk_size=1024):
     if dist.get_rank() == 0:
+        os.makedirs(os.path.split(local_path)[0], exist_ok=True)
         if 'drive.google.com' in url:
-            gdown.download(url, local_path, quiet=False)
+            gdown.download(url, local_path, quiet=False, fuzzy=True)
         else:
-            os.makedirs(os.path.split(local_path)[0], exist_ok=True)
             with requests.get(url, stream=True) as r:
                 total_size = int(r.headers.get("content-length", 0))
                 with tqdm(total=total_size, unit="B", unit_scale=True) as pbar:
@@ -101,6 +101,7 @@ def ckpt_path_adm(name, cfg):
 
     ckpt_root = os.path.join(cfg.exp.root, cfg.exp.ckpt_root)
     ckpt = os.path.join(ckpt_root, CKPT_MAP[name])
+    os.makedirs(os.path.dirname(ckpt), exist_ok=True)
     if not os.path.exists(ckpt):
         logger.info(URL_MAP[name])
         download(URL_MAP[name], ckpt)
