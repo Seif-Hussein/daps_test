@@ -439,6 +439,22 @@ def _to_uint8_image(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _ensure_minus1_1_image(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32).squeeze()
+    lo = float(np.nanmin(arr))
+    hi = float(np.nanmax(arr))
+
+    # Diffusers pipelines typically return numpy images in [0, 1].
+    if lo >= -1.0e-4 and hi <= 1.0 + 1.0e-4:
+        return arr * 2.0 - 1.0
+
+    # If the pipeline already returns data in [-1, 1], leave it alone.
+    if lo >= -1.0 - 1.0e-4 and hi <= 1.0 + 1.0e-4:
+        return arr
+
+    return np.clip(arr, -1.0, 1.0)
+
+
 def _load_preprocessed_slice(path: Path) -> np.ndarray:
     suffix = path.suffix.lower()
     if suffix in {".tif", ".tiff"}:
@@ -735,7 +751,7 @@ def main():
                     output_type=np.array,
                 )
 
-            recon_arr = np.asarray(output.images[0], dtype=np.float32).squeeze()
+            recon_arr = _ensure_minus1_1_image(output.images[0])
             psnr, ssim, gt01, rec01 = _compute_metrics(gt_arr, recon_arr)
             psnrs.append(psnr)
             ssims.append(ssim)
