@@ -56,7 +56,9 @@ The medical CT acquisition presets follow the DM4CT benchmark setup:
 - `medical_80_more_noise`
 - `medical_80_noise_ring`
 
-When `MEASUREMENT_MATCH_MODE="shared_counts"`, the notebook samples one cached **native transmission-count** realization per image and derives the DM4CT log measurement from those same counts. This is the fairest bridge to a native-count benchmark.
+By default, this notebook sanity-checks the official DM4CT path on the original three `L067` source slices with the cleaner `medical_40_clean` preset.
+
+When `MEASUREMENT_MATCH_MODE="shared_counts"`, the notebook samples one cached **native transmission-count** realization per image and derives the DM4CT log measurement from those same counts. That is useful for cross-framework comparisons, but it is not the pure official DM4CT benchmark path.
 
 When `DRIVE_CT_DATA_DIR` is left blank, the notebook uses the original three `L067/full_1mm_sharp` medical CT slices corresponding to the convenience subset: slices `0009`, `0080`, and `0528`.
 """,
@@ -94,7 +96,7 @@ HF_MODEL_ID = "jiayangshi/lodochallenge_pixel_diffusion"  #@param {type:"string"
 RUN_NAME = "DM4CT_CT_Official_Benchmark"  #@param {type:"string"}
 SESSION_TAG = ""  #@param {type:"string"}
 METHOD = "reddiff"  #@param ["reddiff", "dps"]
-MEDICAL_CT_PRESET = "medical_80_more_noise"  #@param ["medical_40_clean", "medical_20_mild_noise", "medical_80_more_noise", "medical_80_noise_ring", "custom"]
+MEDICAL_CT_PRESET = "medical_40_clean"  #@param ["medical_40_clean", "medical_20_mild_noise", "medical_80_more_noise", "medical_80_noise_ring", "custom"]
 
 SEED = 99  #@param {type:"integer"}
 TOTAL_IMAGES = 3  #@param {type:"integer"}
@@ -110,10 +112,11 @@ DATA_PREP_MODE = "global_minmax_to_tiff"  #@param ["global_minmax_to_tiff", "reu
 PREP_OUTPUT_DIR = "/content/dm4ct_preprocessed"  #@param {type:"string"}
 VALID_EXTENSIONS = ".tif,.tiff,.png,.jpg,.jpeg,.dcm,.ima"  #@param {type:"string"}
 
-# Optional shared-count mode for repeated official DM4CT runs.
+# Measurement mode:
 # - independent: official DM4CT noiser path
 # - shared_counts: derive the DM4CT log measurement from one cached native-count realization
-MEASUREMENT_MATCH_MODE = "shared_counts"  #@param ["independent", "shared_counts"]
+#   for cross-framework comparisons against a native-count method
+MEASUREMENT_MATCH_MODE = "independent"  #@param ["independent", "shared_counts"]
 
 # Custom acquisition settings used only when MEDICAL_CT_PRESET = "custom".
 CUSTOM_NUM_ANGLES = 80  #@param {type:"integer"}
@@ -910,6 +913,13 @@ if ALLOW_METHOD_OVERRIDES:
         effective_reddiff_lr = float(REDDIFF_LR_OVERRIDE)
         effective_reddiff_meas_weight = float(REDDIFF_MEAS_WEIGHT_OVERRIDE)
         effective_reddiff_noise_weight = float(REDDIFF_NOISE_WEIGHT_OVERRIDE)
+
+if MEASUREMENT_MATCH_MODE == "shared_counts":
+    print(
+        "Warning: shared_counts reuses a native-count measurement realization for "
+        "cross-framework comparisons. For a pure official DM4CT benchmark run, use "
+        "MEASUREMENT_MATCH_MODE='independent'."
+    )
 
 measurement_cache_root = None
 if MEASUREMENT_MATCH_MODE == "shared_counts":
