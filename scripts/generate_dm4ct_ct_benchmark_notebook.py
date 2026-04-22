@@ -408,7 +408,7 @@ from pathlib import Path
 import astra
 import numpy as np
 import torch
-from diffusers import DDPMScheduler, DDIMScheduler, UNet2DModel
+from diffusers import DDPMPipeline, DDPMScheduler, DDIMScheduler, UNet2DModel
 from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from tifffile import imwrite
@@ -609,6 +609,40 @@ def _compute_metrics(gt: np.ndarray, recon: np.ndarray):
     return float(psnr), float(ssim), gt01, rec01
 
 
+def _load_diffusers_unet(model_ref: str, device: str):
+    errors = []
+
+    try:
+        base_pipeline = DDPMPipeline.from_pretrained(model_ref)
+        scheduler_config = base_pipeline.scheduler.config
+        unet = base_pipeline.unet.to(device)
+        return unet, scheduler_config
+    except Exception as exc:
+        errors.append(f"DDPMPipeline.from_pretrained({model_ref!r}) failed: {exc}")
+
+    try:
+        scheduler = DDPMScheduler.from_pretrained(model_ref, subfolder="scheduler")
+        unet = UNet2DModel.from_pretrained(model_ref, subfolder="unet").to(device)
+        return unet, scheduler.config
+    except Exception as exc:
+        errors.append(f"UNet/scheduler subfolder load for {model_ref!r} failed: {exc}")
+
+    try:
+        unet = UNet2DModel.from_pretrained(model_ref).to(device)
+        scheduler = DDPMScheduler(num_train_timesteps=1000)
+        return unet, scheduler.config
+    except Exception as exc:
+        errors.append(f"Bare UNet2DModel.from_pretrained({model_ref!r}) failed: {exc}")
+
+    joined = "\\n".join(errors)
+    raise RuntimeError(
+        "Could not load the DM4CT pixel diffusion model. "
+        "If you are using a local checkpoint path, it should point to a diffusers-style "
+        "pipeline directory (or at least a directory containing the UNet weights). "
+        f"Load attempts were:\\n{joined}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -643,13 +677,13 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model_ref = cfg["model_ref"]
-    unet = UNet2DModel.from_pretrained(model_ref).to(device)
+    unet, scheduler_config = _load_diffusers_unet(model_ref, device)
 
     if cfg["method"] == "dps":
-        scheduler = DDPMScheduler(num_train_timesteps=1000)
+        scheduler = DDPMScheduler.from_config(scheduler_config)
         pipeline = DDPMPipelineDPS(unet=unet, scheduler=scheduler)
     elif cfg["method"] == "reddiff":
-        scheduler = DDIMScheduler(num_train_timesteps=1000)
+        scheduler = DDIMScheduler.from_config(scheduler_config)
         pipeline = DDPMPipelineRedDiff(unet=unet, scheduler=scheduler)
     else:
         raise ValueError(f"Unsupported method: {cfg['method']}")
