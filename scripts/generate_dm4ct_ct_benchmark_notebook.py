@@ -58,7 +58,7 @@ The medical CT acquisition presets follow the DM4CT benchmark setup:
 
 When `MEASUREMENT_MATCH_MODE="shared_counts"`, the notebook samples one cached **native transmission-count** realization per image and derives the DM4CT log measurement from those same counts. This is the fairest bridge to a native-count benchmark.
 
-When `DRIVE_CT_DATA_DIR` is left blank, the notebook first tries to reuse the CT demo data already available in `mycode2`, preferring the fuller `demo-samples/full_1mm_sharp` tree and then the small `ct_l067_subset` fallback.
+When `DRIVE_CT_DATA_DIR` is left blank, the notebook automatically fetches the `mycode2` support repo if needed and then reuses its CT demo data, preferring the fuller `demo-samples/full_1mm_sharp` tree and then the small `ct_l067_subset` fallback.
 """,
         cell_id="title",
     ),
@@ -233,6 +233,8 @@ else:
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -283,14 +285,43 @@ def _collect_files(root: Path, extensions):
     return files
 
 
+def _maybe_fetch_mycode2_support_repo():
+    support_repo_dir = Path("/content/mycode2")
+    support_candidates = [
+        support_repo_dir / "demo-samples" / "full_1mm_sharp",
+        support_repo_dir / "demo-samples" / "ct_l067_subset",
+    ]
+    if any(path.exists() for path in support_candidates):
+        return support_repo_dir
+
+    if support_repo_dir.exists():
+        shutil.rmtree(support_repo_dir)
+
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            "codex-pdhg-colab-light-100",
+            "https://github.com/Seif-Hussein/dyscode.git",
+            support_repo_dir.as_posix(),
+        ],
+        check=True,
+    )
+    return support_repo_dir
+
+
 if DRIVE_CT_DATA_DIR.strip():
     input_root = Path(DRIVE_CT_DATA_DIR)
     if not input_root.exists():
         raise FileNotFoundError(f"CT data root not found: {input_root}")
 else:
+    support_repo_dir = _maybe_fetch_mycode2_support_repo()
     fallback_candidates = [
-        Path("/content/mycode2") / "demo-samples" / "full_1mm_sharp",
-        Path("/content/mycode2") / "demo-samples" / "ct_l067_subset",
+        support_repo_dir / "demo-samples" / "full_1mm_sharp",
+        support_repo_dir / "demo-samples" / "ct_l067_subset",
         Path(REPO_DIR) / "demo-samples" / "full_1mm_sharp",
         Path(REPO_DIR) / "demo-samples" / "ct_l067_subset",
         Path(REPO_DIR) / "demo_samples" / "full_1mm_sharp",
