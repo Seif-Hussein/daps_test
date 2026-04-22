@@ -84,6 +84,7 @@ REPO_DIR = "/content/DM4CT"  #@param {type:"string"}
 PYTHON_BIN = "/usr/bin/python3"  #@param {type:"string"}
 DRIVE_EXPORT_DIR = "/content/drive/MyDrive/dm4ct_ct_benchmark_exports"  #@param {type:"string"}
 DRIVE_CT_DATA_DIR = ""  #@param {type:"string"}
+DRIVE_CHECKPOINT_DIR = ""  #@param {type:"string"}
 DRIVE_MODEL_PATH = ""  #@param {type:"string"}
 DRIVE_MEASUREMENT_CACHE_DIR = ""  #@param {type:"string"}
 HF_MODEL_ID = "jiayangshi/lodochallenge_pixel_diffusion"  #@param {type:"string"}
@@ -196,6 +197,36 @@ subprocess.run(deps, check=True)
 """
     ),
     code_cell(
+        """#@title Optional: Copy Local Checkpoint From Drive
+import os
+import shutil
+from pathlib import Path
+
+os.chdir(REPO_DIR)
+local_checkpoint_path = None
+
+if DRIVE_CHECKPOINT_DIR.strip():
+    src = Path(DRIVE_CHECKPOINT_DIR)
+    if not src.exists():
+        raise FileNotFoundError(f"Checkpoint folder not found: {src}")
+    dst = Path(REPO_DIR) / "pretrained-models" / "dm4ct" / "lodochallenge_pixel_diffusion"
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst)
+    local_checkpoint_path = dst.as_posix()
+    print(f"Copied checkpoint to: {dst}")
+elif DRIVE_MODEL_PATH.strip():
+    src = Path(DRIVE_MODEL_PATH)
+    if not src.exists():
+        raise FileNotFoundError(f"Model path not found: {src}")
+    local_checkpoint_path = src.as_posix()
+    print(f"Using local model path: {src}")
+else:
+    print("Using Hugging Face model download.")
+"""
+    ),
+    code_cell(
         """#@title Prepare CT Data And Model Paths
 import hashlib
 import json
@@ -250,12 +281,22 @@ def _collect_files(root: Path, extensions):
     return files
 
 
-if not DRIVE_CT_DATA_DIR.strip():
-    raise ValueError("DRIVE_CT_DATA_DIR must point to your CT dataset.")
-
-input_root = Path(DRIVE_CT_DATA_DIR)
-if not input_root.exists():
-    raise FileNotFoundError(f"CT data root not found: {input_root}")
+if DRIVE_CT_DATA_DIR.strip():
+    input_root = Path(DRIVE_CT_DATA_DIR)
+    if not input_root.exists():
+        raise FileNotFoundError(f"CT data root not found: {input_root}")
+else:
+    fallback_candidates = [
+        Path(REPO_DIR) / "demo-samples" / "ct_l067_subset",
+        Path(REPO_DIR) / "demo_samples" / "ct_l067_subset",
+    ]
+    input_root = next((path for path in fallback_candidates if path.exists()), None)
+    if input_root is None:
+        searched = ", ".join(path.as_posix() for path in fallback_candidates)
+        raise ValueError(
+            "DRIVE_CT_DATA_DIR is empty and no repo-safe CT subset was found. "
+            f"Looked in: {searched}"
+        )
 
 extensions = _parse_extensions(VALID_EXTENSIONS)
 all_files = _collect_files(input_root, extensions)
@@ -309,11 +350,8 @@ elif DATA_PREP_MODE == "reuse_preprocessed_tiff":
 else:
     raise ValueError(f"Unsupported DATA_PREP_MODE: {DATA_PREP_MODE}")
 
-if DRIVE_MODEL_PATH.strip():
-    effective_model_path = Path(DRIVE_MODEL_PATH)
-    if not effective_model_path.exists():
-        raise FileNotFoundError(f"Model path not found: {effective_model_path}")
-    model_ref = effective_model_path.as_posix()
+if local_checkpoint_path:
+    model_ref = local_checkpoint_path
 else:
     model_ref = HF_MODEL_ID
 
