@@ -97,18 +97,19 @@ VALID_EXTENSIONS = ".tif,.tiff,.png,.jpg,.jpeg,.dcm,.ima"  #@param {type:"string
 CT_VALUE_MIN = ""  #@param {type:"string"}
 CT_VALUE_MAX = ""  #@param {type:"string"}
 
-NUM_STEPS = 400  #@param {type:"integer"}
+# Shared DPS diffusion schedule in this codebase.
+# These are not PDHG settings; they are the sigma/noise schedule used by `edm_dps`.
+NUM_STEPS = 100  #@param {type:"integer"}
 SIGMA_MAX = 10.0  #@param {type:"number"}
-SIGMA_MIN = 0.075  #@param {type:"number"}
+SIGMA_MIN = 0.1  #@param {type:"number"}
 
-# DPS port settings in the native-count formulation.
+# DPS-specific settings in the native-count formulation.
 DPS_STEP_SIZE = 10.0  #@param {type:"number"}
 DPS_ZETA_MODE = "constant"  #@param ["constant", "residual_norm"]
 
+# CT acquisition settings for your formulation.
 I0 = 10000.0  #@param {type:"number"}
 NUM_ANGLES = 80  #@param {type:"integer"}
-DM4CT_PINV_METHOD = "sirt"  #@param ["sirt", "fbp", "backproject"]
-DM4CT_PINV_ITERS = 60  #@param {type:"integer"}
 
 EVAL_METRICS = "psnr;ssim"  #@param {type:"string"}
 SAVE_SAMPLES = True  #@param {type:"boolean"}
@@ -406,11 +407,6 @@ class TransmissionCTNative(Operator):
         channels=1,
         clamp_input=True,
         sigma=1.0,
-        pinv_method="sirt",
-        pinv_iterations=60,
-        pinv_relax=1.0,
-        pinv_min=0.0,
-        pinv_max=1.0,
         measurement_cache_path="",
         device="cuda",
     ):
@@ -427,19 +423,12 @@ class TransmissionCTNative(Operator):
         self.channels = int(channels)
         self.clamp_input = bool(clamp_input)
         self.device = device
-        self.pinv_method = str(pinv_method).lower()
-        self.pinv_iterations = int(pinv_iterations)
-        self.pinv_relax = float(pinv_relax)
-        self.pinv_min = float(pinv_min)
-        self.pinv_max = float(pinv_max)
         self.measurement_cache_path = str(measurement_cache_path) if measurement_cache_path is not None else ""
 
         angles = torch.arange(self.num_angles, dtype=torch.float32)
         angles = angles * (math.pi / max(1, self.num_angles))
         angles = angles + math.radians(self.angle_offset_deg)
         self.angles = angles
-
-        self._sirt_cache = {}
 
     def _cache_path(self):
         if not self.measurement_cache_path:
@@ -585,60 +574,6 @@ class TransmissionCTNative(Operator):
     def post_ml_op(self, x, y):
         return x
 
-    def _ramp_filter(self, sino: torch.Tensor) -> torch.Tensor:
-        n = sino.shape[-1]
-        freq = torch.fft.rfftfreq(n, d=1.0).to(device=sino.device, dtype=sino.dtype)
-        filt = freq.reshape((1, 1, 1, -1))
-        spec = torch.fft.rfft(sino, dim=-1)
-        return torch.fft.irfft(spec * filt, n=n, dim=-1)
-
-    def _ensure_sirt_weights(self, device, dtype):
-        key = (str(device), str(dtype))
-        if key in self._sirt_cache:
-            return self._sirt_cache[key]
-
-        ones_mu = torch.ones((1, self.channels, self.resolution, self.resolution), device=device, dtype=dtype)
-        R = self._forward_mu(ones_mu)
-        R = torch.where(R > 1.0e-8, 1.0 / R, torch.zeros_like(R))
-
-        ones_sino = torch.ones((1, self.channels, self.num_angles, self.num_detectors), device=device, dtype=dtype)
-        C = self._backproject_mu(ones_sino)
-        C = torch.where(C > 1.0e-8, 1.0 / C, torch.zeros_like(C))
-
-        self._sirt_cache[key] = (R, C)
-        return R, C
-
-    def _pinv_backproject(self, measurement: torch.Tensor) -> torch.Tensor:
-        return self._backproject_mu(measurement) / max(self.num_angles, 1)
-
-    def _pinv_fbp(self, measurement: torch.Tensor) -> torch.Tensor:
-        filtered = self._ramp_filter(measurement)
-        recon = self._backproject_mu(filtered)
-        recon = recon * (math.pi / max(2 * self.num_angles, 1))
-        return recon
-
-    def _pinv_sirt(self, measurement: torch.Tensor) -> torch.Tensor:
-        mu = torch.zeros(
-            (measurement.shape[0], self.channels, self.resolution, self.resolution),
-            device=measurement.device,
-            dtype=measurement.dtype,
-        )
-        R, C = self._ensure_sirt_weights(measurement.device, measurement.dtype)
-        for _ in range(max(self.pinv_iterations, 1)):
-            residual = measurement - self._forward_mu(mu)
-            mu = mu + self.pinv_relax * (C * self._backproject_mu(R * residual))
-            mu = mu.clamp(min=self.pinv_min, max=self.pinv_max)
-        return mu
-
-    def pinv(self, measurement: torch.Tensor) -> torch.Tensor:
-        method = self.pinv_method
-        if method == "backproject":
-            mu = self._pinv_backproject(measurement)
-        elif method == "fbp":
-            mu = self._pinv_fbp(measurement)
-        else:
-            mu = self._pinv_sirt(measurement)
-        return self._image_from_mu(mu)
 '''
 
 native_operator_path = Path(REPO_DIR) / "measurements" / "transmission_ct_native.py"
@@ -700,8 +635,6 @@ overrides = [
     "inverse_task.operator.name=transmission_ct_native",
     f"inverse_task.operator.I0={I0}",
     f"inverse_task.operator.num_angles={NUM_ANGLES}",
-    f"+inverse_task.operator.pinv_method={DM4CT_PINV_METHOD}",
-    f"+inverse_task.operator.pinv_iterations={DM4CT_PINV_ITERS}",
     f"+inverse_task.admm_config.dps.zeta_base={DPS_STEP_SIZE}",
     f"+inverse_task.admm_config.dps.zeta_mode={DPS_ZETA_MODE}",
     "+inverse_task.admm_config.dps.zeta_min=0.0",
