@@ -97,13 +97,15 @@ VALID_EXTENSIONS = ".tif,.tiff,.png,.jpg,.jpeg,.dcm,.ima"  #@param {type:"string
 CT_VALUE_MIN = ""  #@param {type:"string"}
 CT_VALUE_MAX = ""  #@param {type:"string"}
 
-# Shared DPS diffusion schedule in this codebase.
-# These are not PDHG settings; they are the sigma/noise schedule used by `edm_dps`.
-NUM_STEPS = 100  #@param {type:"integer"}
+# DM4CT-inspired DPS starting point:
+# - 1000 reverse steps
+# The sigma schedule itself is specific to this codebase's `edm_dps` sampler.
+NUM_STEPS = 1000  #@param {type:"integer"}
 SIGMA_MAX = 10.0  #@param {type:"number"}
 SIGMA_MIN = 0.1  #@param {type:"number"}
 
 # DPS-specific settings in the native-count formulation.
+# Start from the DM4CT DPS step-size setting.
 DPS_STEP_SIZE = 10.0  #@param {type:"number"}
 DPS_ZETA_MODE = "constant"  #@param ["constant", "residual_norm"]
 
