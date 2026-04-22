@@ -58,7 +58,7 @@ The medical CT acquisition presets follow the DM4CT benchmark setup:
 
 When `MEASUREMENT_MATCH_MODE="shared_counts"`, the notebook samples one cached **native transmission-count** realization per image and derives the DM4CT log measurement from those same counts. This is the fairest bridge to a native-count benchmark.
 
-When `DRIVE_CT_DATA_DIR` is left blank, the notebook uses the same 3-slice CT subset (`ct_l067_subset`) used by the other Colab notebook: `ct_slice_009`, `ct_slice_080`, and `ct_slice_528`.
+When `DRIVE_CT_DATA_DIR` is left blank, the notebook uses the original three `L067/full_1mm_sharp` medical CT slices corresponding to the convenience subset: slices `0009`, `0080`, and `0528`.
 """,
         cell_id="title",
     ),
@@ -289,26 +289,26 @@ if DRIVE_CT_DATA_DIR.strip():
         raise FileNotFoundError(f"CT data root not found: {input_root}")
 else:
     fallback_candidates = [
-        Path(REPO_DIR) / "demo-samples" / "ct_l067_subset",
-        Path(REPO_DIR) / "demo_samples" / "ct_l067_subset",
+        Path(REPO_DIR) / "demo-samples" / "ct_l067_original_ima_subset",
+        Path(REPO_DIR) / "demo_samples" / "ct_l067_original_ima_subset",
     ]
     input_root = next((path for path in fallback_candidates if path.exists()), None)
     if input_root is None:
-        # The official DM4CT repo does not ship the tiny safe CT subset that our
-        # other Colab notebooks use, so fetch the same 3-slice subset from this
-        # support branch when the user leaves DRIVE_CT_DATA_DIR blank.
+        # The official DM4CT repo does not ship the small original-CT support
+        # subset we use for Colab, so fetch the three source DICOM/IMA slices
+        # from this support branch when the user leaves DRIVE_CT_DATA_DIR blank.
         import urllib.request
 
-        support_root = Path("/content/dm4ct_support_subset") / "ct_l067_subset"
+        support_root = Path("/content/dm4ct_support_subset") / "ct_l067_original_ima_subset"
         support_root.mkdir(parents=True, exist_ok=True)
         base_url = (
             "https://raw.githubusercontent.com/Seif-Hussein/daps_test/"
-            "codex-reddiff-colab-operators/demo-samples/ct_l067_subset"
+            "codex-reddiff-colab-operators/demo-samples/ct_l067_original_ima_subset"
         )
         subset_files = [
-            "ct_slice_009.png",
-            "ct_slice_080.png",
-            "ct_slice_528.png",
+            "L067_FD_1_SHARP_1.CT.0002.0009.2016.01.21.18.11.40.977560.404629207.IMA",
+            "L067_FD_1_SHARP_1.CT.0002.0080.2016.01.21.18.11.40.977560.404630911.IMA",
+            "L067_FD_1_SHARP_1.CT.0002.0528.2016.01.21.18.11.40.977560.404644046.IMA",
         ]
         for name in subset_files:
             dst = support_root / name
@@ -343,12 +343,19 @@ global_max = None
 prepared_paths = []
 
 if DATA_PREP_MODE == "global_minmax_to_tiff":
-    for path in all_files:
-        arr = _load_array(path)
-        cur_min = float(np.nanmin(arr))
-        cur_max = float(np.nanmax(arr))
-        global_min = cur_min if global_min is None else min(global_min, cur_min)
-        global_max = cur_max if global_max is None else max(global_max, cur_max)
+    # For the bundled three-slice original-CT support subset, use the reference
+    # LoDoChallenge value range from the source L067 stack instead of recomputing
+    # min/max from only three slices.
+    if (not DRIVE_CT_DATA_DIR.strip()) and input_root.name == "ct_l067_original_ima_subset":
+        global_min = -1024.0
+        global_max = 3071.0
+    else:
+        for path in all_files:
+            arr = _load_array(path)
+            cur_min = float(np.nanmin(arr))
+            cur_max = float(np.nanmax(arr))
+            global_min = cur_min if global_min is None else min(global_min, cur_min)
+            global_max = cur_max if global_max is None else max(global_max, cur_max)
 
     if global_max <= global_min:
         raise ValueError("Global CT value range is degenerate.")
