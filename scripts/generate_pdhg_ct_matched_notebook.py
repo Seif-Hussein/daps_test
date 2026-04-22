@@ -402,7 +402,7 @@ from sampler import get_sampler
 from utils import set_seed
 from utils.eval import Evaluator, get_eval_fn, get_eval_fn_cmp
 from utils.inverse_sampler import sample_in_batch
-from utils.logging import log_results
+from utils.logging import log_results, resize, tensor_to_pils
 
 
 def _atomic_json_dump(path: Path, payload):
@@ -567,6 +567,13 @@ def main():
         )
 
         artifact_root = save_root / f"{run_args.name}_{run_args.data.name}_{run_args.inverse_task.operator.name}"
+        measurement_dir = artifact_root / "measurement"
+        measurement_dir.mkdir(parents=True, exist_ok=True)
+        measurement_vis = resize(y, images, run_args.inverse_task.operator.name)
+        measurement_pils = tensor_to_pils(measurement_vis)
+        for idx in range(total_number):
+            measurement_pils[idx].save(measurement_dir / f"{idx:05d}_run0000.png")
+
         metrics_path = artifact_root / "metrics.json"
         metric_history_path = artifact_root / "metric_history.json"
 

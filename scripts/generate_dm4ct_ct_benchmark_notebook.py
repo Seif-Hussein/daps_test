@@ -478,6 +478,19 @@ def _load_preprocessed_slice(path: Path) -> np.ndarray:
     return arr
 
 
+def _measurement_to_uint8_image(measurement: torch.Tensor) -> np.ndarray:
+    arr = measurement.detach().to(device="cpu", dtype=torch.float32).numpy().squeeze()
+    arr = np.asarray(arr, dtype=np.float32)
+    lo = float(np.nanmin(arr))
+    hi = float(np.nanmax(arr))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        arr = np.zeros_like(arr, dtype=np.float32)
+    else:
+        arr = (arr - lo) / (hi - lo)
+    arr = np.clip(arr, 0.0, 1.0)
+    return np.round(arr * 255.0).astype(np.uint8)
+
+
 class SharedCountPoissonNoise(PoissonNoise):
     def __init__(self, transmittance_rate: float, phonton_count: float, cache_root: str = ""):
         super().__init__(transmittance_rate, phonton_count)
@@ -765,8 +778,10 @@ def main():
 
             if cfg["save_samples"]:
                 gt_png = Image.fromarray(_to_uint8_image(gt_arr), mode="L")
+                measured_png = Image.fromarray(_measurement_to_uint8_image(measurement_noisy), mode="L")
                 rec_png = Image.fromarray(_to_uint8_image(recon_arr), mode="L")
                 gt_png.save(samples_root / f"{image_offset:05d}_gt.png")
+                measured_png.save(samples_root / f"{image_offset:05d}_measured.png")
                 rec_png.save(samples_root / f"{image_offset:05d}_{cfg['method']}.png")
                 imwrite(samples_root / f"{image_offset:05d}_{cfg['method']}.tif", recon_arr.astype(np.float32))
 
