@@ -942,6 +942,7 @@ if MEASUREMENT_MATCH_MODE == "shared_counts":
     signature_payload = {
         "prepared_root": prep_context["prepared_root"],
         "selected_files": prep_context["prepared_paths"],
+        "operator_family": "dm4ct_astra",
         "preset": MEDICAL_CT_PRESET,
         "seed": int(SEED),
         "num_angles": int(effective["num_angles"]),

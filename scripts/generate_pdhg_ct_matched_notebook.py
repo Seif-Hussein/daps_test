@@ -42,6 +42,7 @@ It is designed for the comparison protocol we settled on:
 - same original source slices
 - fixed CT-value normalization to `[-1, 1]`
 - same native-count acquisition (`num_angles`, `I0`, seed)
+- optional ASTRA projector backend to better match the DM4CT geometry
 - optional **shared count cache** compatible with the DM4CT benchmark notebook
 
 The main use case is:
@@ -112,6 +113,13 @@ MEASUREMENT_MATCH_MODE = "shared_counts"  #@param ["independent", "shared_counts
 # the default "custom" together with 80 angles and I0=10000.
 DM4CT_CACHE_PRESET_TAG = "custom"  #@param {type:"string"}
 
+# Projector backend:
+# - astra: ASTRA parallel-beam projector with the same geometry family as DM4CT.
+#   In this mode, the notebook also switches the operator attenuation range to
+#   [-1, 1] so the projected values line up with the DM4CT-preprocessed slices.
+# - native: original differentiable rotate/sum projector from dyscode
+CT_OPERATOR_BACKEND = "astra"  #@param ["astra", "native"]
+
 NUM_STEPS = 400  #@param {type:"integer"}
 MAX_ITER = 400  #@param {type:"integer"}
 SIGMA_MAX = 10.0  #@param {type:"number"}
@@ -176,6 +184,7 @@ import subprocess
 
 os.chdir(REPO_DIR)
 subprocess.run([PYTHON_BIN, "-m", "pip", "install", "-r", "requirements-colab-ct.txt"], check=True)
+subprocess.run([PYTHON_BIN, "-m", "pip", "install", "astra-toolbox"], check=True)
 """
     ),
     code_cell(
@@ -346,12 +355,15 @@ if local_checkpoint_path:
 else:
     model_ref = HF_MODEL_ID
 
+operator_family = "dm4ct_astra" if CT_OPERATOR_BACKEND == "astra" else "native_counts_rotate_sum"
+
 measurement_cache_root = None
 if MEASUREMENT_MATCH_MODE == "shared_counts":
     cache_root = Path(DRIVE_MEASUREMENT_CACHE_DIR) if DRIVE_MEASUREMENT_CACHE_DIR.strip() else Path(DRIVE_EXPORT_DIR) / "dm4ct_shared_counts"
     signature_payload = {
         "prepared_root": prepared_root.as_posix(),
         "selected_files": [p.as_posix() for p in prepared_paths],
+        "operator_family": operator_family,
         "preset": DM4CT_CACHE_PRESET_TAG,
         "seed": int(SEED),
         "num_angles": int(NUM_ANGLES),
@@ -369,6 +381,8 @@ prep_context = {
     "global_min": float(global_min),
     "global_max": float(global_max),
     "model_ref": model_ref,
+    "operator_backend": CT_OPERATOR_BACKEND,
+    "operator_family": operator_family,
     "measurement_cache_root": measurement_cache_root.as_posix() if measurement_cache_root is not None else "",
 }
 
@@ -391,18 +405,163 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import astra
+import astra.experimental
 from hydra import compose, initialize
 from omegaconf import OmegaConf
+from scipy.special import lambertw
 from torch.utils.data import DataLoader
 
 from datasets import get_dataset
 from measurements import get_operator
+from measurements.base import Operator as MeasurementBase
+from measurements.registry import register_operator
 from model import get_model
 from sampler import get_sampler
 from utils import set_seed
 from utils.eval import Evaluator, get_eval_fn, get_eval_fn_cmp
 from utils.inverse_sampler import sample_in_batch
 from utils.logging import log_results, resize, tensor_to_pils
+
+
+@register_operator(name="transmission_ct_astra")
+class TransmissionCTAstra(MeasurementBase):
+    measurement_model = "transmission_ct"
+
+    def __init__(self,
+                 resolution=512,
+                 num_angles=80,
+                 num_detectors=None,
+                 angle_offset_deg=0.0,
+                 detector_scale=1.0,
+                 attenuation_min=0.0,
+                 attenuation_max=1.0,
+                 eta=1.0,
+                 I0=1.0e4,
+                 channels=1,
+                 clamp_input=True,
+                 sigma=1.0,
+                 device="cuda"):
+        super().__init__(sigma)
+        self.resolution = int(resolution)
+        self.num_angles = int(num_angles)
+        self.num_detectors = int(num_detectors) if num_detectors is not None else int(resolution)
+        self.angle_offset_deg = float(angle_offset_deg)
+        self.detector_scale = float(detector_scale)
+        self.attenuation_min = float(attenuation_min)
+        self.attenuation_max = float(attenuation_max)
+        self.eta = float(eta)
+        self.I0 = float(I0)
+        self.channels = int(channels)
+        self.clamp_input = bool(clamp_input)
+        self.device = device
+
+        if self.channels != 1:
+            raise ValueError("TransmissionCTAstra currently supports channels=1 only.")
+
+        angles = np.linspace(0.0, np.pi, self.num_angles, dtype=np.float32)
+        angles = angles + np.float32(np.deg2rad(self.angle_offset_deg))
+        self.angles = angles
+
+        self.volume_geometry = astra.create_vol_geom(self.resolution, self.resolution, 1)
+        self.projection_geometry = astra.create_proj_geom(
+            "parallel3d",
+            1.0,
+            1.0,
+            1,
+            self.num_detectors,
+            self.angles,
+        )
+        self.projector = astra.create_projector("cuda3d", self.projection_geometry, self.volume_geometry)
+        self.projection_shape = tuple(astra.geom_size(self.projection_geometry))
+        self.volume_shape = tuple(astra.geom_size(self.volume_geometry))
+
+    def _attenuation_image(self, x: torch.Tensor) -> torch.Tensor:
+        x01 = (x + 1.0) * 0.5
+        if self.clamp_input:
+            x01 = x01.clamp(0.0, 1.0)
+        return self.attenuation_min + x01 * (self.attenuation_max - self.attenuation_min)
+
+    def _fp_single(self, volume: torch.Tensor) -> torch.Tensor:
+        proj = torch.zeros(self.projection_shape, dtype=torch.float32, device=volume.device)
+        astra.experimental.direct_FP3D(self.projector, vol=volume.contiguous().detach().to(dtype=torch.float32), proj=proj)
+        return proj
+
+    def _bp_single(self, projection: torch.Tensor) -> torch.Tensor:
+        vol = torch.zeros(self.volume_shape, dtype=torch.float32, device=projection.device)
+        astra.experimental.direct_BP3D(
+            self.projector,
+            vol=vol,
+            proj=(projection.contiguous().detach().to(dtype=torch.float32) / max(self.detector_scale, 1.0e-12)),
+        )
+        return vol
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        mu = self._attenuation_image(x)
+        if mu.dim() == 4:
+            batch = mu.shape[0]
+            out = torch.zeros((batch, *self.projection_shape), dtype=torch.float32, device=mu.device)
+            for idx in range(batch):
+                out[idx] = self._fp_single(mu[idx])
+        elif mu.dim() == 3:
+            out = self._fp_single(mu)
+        else:
+            raise ValueError(f"Expected [B,1,H,W] or [1,H,W], got {tuple(mu.shape)}")
+        return out * self.detector_scale
+
+    def adjoint(self, p: torch.Tensor, x_like: torch.Tensor | None = None) -> torch.Tensor:
+        if p.dim() == 4:
+            batch = p.shape[0]
+            out = torch.zeros((batch, 1, self.resolution, self.resolution), dtype=torch.float32, device=p.device)
+            for idx in range(batch):
+                out[idx] = self._bp_single(p[idx])
+        elif p.dim() == 3:
+            out = self._bp_single(p).unsqueeze(0)
+        else:
+            raise ValueError(f"Expected [B,1,A,W] or [1,A,W], got {tuple(p.shape)}")
+
+        scale = 0.5 * (self.attenuation_max - self.attenuation_min)
+        out = out * scale
+        if self.clamp_input and x_like is not None:
+            mask = ((x_like > -1.0) & (x_like < 1.0)).to(dtype=out.dtype)
+            out = out * mask
+        return out.to(dtype=p.dtype)
+
+    def incident_counts(self, reference: torch.Tensor) -> torch.Tensor:
+        i0 = torch.as_tensor(self.I0, device=reference.device, dtype=reference.dtype)
+        while i0.dim() < reference.dim():
+            i0 = i0.unsqueeze(0)
+        return torch.broadcast_to(i0, reference.shape)
+
+    @staticmethod
+    def _lambertw_principal(x: torch.Tensor) -> torch.Tensor:
+        x_cpu = x.detach().to(device="cpu", dtype=torch.float64).numpy()
+        w_cpu = lambertw(x_cpu, k=0).real
+        return torch.from_numpy(w_cpu).to(device=x.device, dtype=x.dtype)
+
+    def dual_prox(self, w: torch.Tensor, y_counts: torch.Tensor, sigma_dual: float, eps: float = 1.0e-12) -> torch.Tensor:
+        sigma = torch.as_tensor(sigma_dual, device=w.device, dtype=w.dtype)
+        while sigma.dim() < w.dim():
+            sigma = sigma.unsqueeze(0)
+        sigma = torch.broadcast_to(sigma, w.shape)
+        eta = torch.as_tensor(self.eta, device=w.device, dtype=w.dtype)
+        i0 = self.incident_counts(w).to(device=w.device, dtype=w.dtype)
+        arg = (eta * i0 / sigma.clamp_min(eps)) * torch.exp(
+            (-w + (eta * y_counts) / sigma).clamp(min=-80.0, max=80.0)
+        )
+        arg = arg.clamp_min(0.0)
+        return w - (eta * y_counts) / sigma + self._lambertw_principal(arg)
+
+    def measure(self, x: torch.Tensor) -> torch.Tensor:
+        z = self(x)
+        rate = self.incident_counts(z) * torch.exp(-z).clamp_min(0.0)
+        rate = rate.clamp_min(0.0).clamp_max(1.0e12)
+        return torch.poisson(rate)
+
+    def loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        z = self(x)
+        i0 = self.incident_counts(z)
+        return self.eta * (i0 * torch.exp(-z) + y * z).sum()
 
 
 def _atomic_json_dump(path: Path, payload):
@@ -433,6 +592,8 @@ def _load_or_sample_counts(operator, images: torch.Tensor, prepared_paths: list[
         cache_paths.append(cache_path)
         if cache_path.exists():
             tensor = torch.load(cache_path, map_location="cpu")
+            if tensor.dim() == 3 and getattr(operator, "measurement_model", None) == "transmission_ct":
+                tensor = tensor.unsqueeze(1)
             cached.append(tensor)
         else:
             missing = True
@@ -443,7 +604,10 @@ def _load_or_sample_counts(operator, images: torch.Tensor, prepared_paths: list[
 
     y = operator.measure(images)
     for idx, cache_path in enumerate(cache_paths):
-        torch.save(y[idx:idx + 1].detach().cpu(), cache_path)
+        tensor = y[idx:idx + 1].detach().cpu()
+        if tensor.dim() == 4 and tensor.shape[1] == 1 and getattr(operator, "measurement_model", None) == "transmission_ct":
+            tensor = tensor.squeeze(1)
+        torch.save(tensor, cache_path)
     return y
 
 
@@ -651,6 +815,7 @@ overrides = [
     f"inverse_task.admm_config.max_iter={MAX_ITER}",
     f"inverse_task.admm_config.pdhg.tau={TAU}",
     f"inverse_task.admm_config.pdhg.sigma_dual={SIGMA_DUAL}",
+    f"inverse_task.operator.name={'transmission_ct_astra' if CT_OPERATOR_BACKEND == 'astra' else 'transmission_ct'}",
     f"inverse_task.operator.I0={I0}",
     f"inverse_task.operator.num_angles={NUM_ANGLES}",
     f"data.image_root_path={prep_context['prepared_root']}",
@@ -660,6 +825,12 @@ overrides = [
     "+data.value_max=1.0",
     "model.model_config.local_files_only=" + ("true" if local_checkpoint_path else "false"),
 ]
+
+if CT_OPERATOR_BACKEND == "astra":
+    overrides.extend([
+        "inverse_task.operator.attenuation_min=-1.0",
+        "inverse_task.operator.attenuation_max=1.0",
+    ])
 
 if local_checkpoint_path:
     overrides.append(f"model.model_config.model_id={local_checkpoint_path}")
@@ -677,6 +848,8 @@ runner_config = {
     "save_root": save_root.as_posix(),
     "prepared_root": prep_context["prepared_root"],
     "prepared_paths": prep_context["prepared_paths"],
+    "operator_backend": CT_OPERATOR_BACKEND,
+    "operator_family": prep_context["operator_family"],
     "measurement_match_mode": MEASUREMENT_MATCH_MODE,
     "measurement_cache_root": prep_context["measurement_cache_root"],
     "global_min": prep_context["global_min"],
@@ -698,6 +871,9 @@ summary = {
     "config_name": CONFIG_NAME,
     "prepared_root": prep_context["prepared_root"],
     "prepared_paths": prep_context["prepared_paths"],
+    "operator_backend": CT_OPERATOR_BACKEND,
+    "operator_family": prep_context["operator_family"],
+    "operator_value_range": "[-1, 1]" if CT_OPERATOR_BACKEND == "astra" else "[0, 1]",
     "measurement_match_mode": MEASUREMENT_MATCH_MODE,
     "measurement_cache_root": prep_context["measurement_cache_root"],
     "num_angles": NUM_ANGLES,
