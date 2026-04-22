@@ -29,7 +29,7 @@ def markdown_cell(source: str, cell_id: str | None = None) -> dict:
 
 cells = [
     markdown_cell(
-        """# PDHG CT Matched-Counts Benchmark In Colab
+        """# PDHG CT Benchmark In Colab
 
 This notebook runs the `mycode2` / `dyscode` **PDHG** CT pipeline on the original three `L067` medical CT source slices:
 
@@ -37,19 +37,20 @@ This notebook runs the `mycode2` / `dyscode` **PDHG** CT pipeline on the origina
 - `0080`
 - `0528`
 
-It is designed for the comparison protocol we settled on:
+It keeps the **native-count PDHG formulation** intact:
 
 - same original source slices
 - fixed CT-value normalization to `[-1, 1]`
 - same native-count acquisition (`num_angles`, `I0`, seed)
-- optional ASTRA projector backend to better match the DM4CT geometry
-- optional **shared count cache** compatible with the DM4CT benchmark notebook
+- same nonnegative attenuation mapping before Poisson count sampling
+- optional ASTRA projector backend as a projector implementation swap only
+- optional shared-count export for separate comparison experiments
 
 The main use case is:
 
-1. run the official DM4CT notebook in `custom + shared_counts` mode
-2. run this PDHG notebook with the same acquisition settings
-3. compare methods under the same sampled photon counts
+1. run a faithful PDHG benchmark with the original transmission-count model
+2. optionally switch projector backend between `native` and `astra`
+3. optionally export cached counts for separate comparison experiments
 """,
         cell_id="title",
     ),
@@ -90,8 +91,8 @@ TOTAL_IMAGES = 3  #@param {type:"integer"}
 DATA_START_IDX = 0  #@param {type:"integer"}
 LOG_TAIL_LINES = 120  #@param {type:"integer"}
 
-# Use the same TIFF-preparation path as the DM4CT benchmark notebook so both
-# notebooks can reuse the same count cache when the acquisition matches.
+# Use fixed-range TIFF preparation so the original CT-valued slices are fed
+# through the same normalized image domain under both projector backends.
 DATA_PREP_MODE = "global_minmax_to_tiff"  #@param ["global_minmax_to_tiff", "reuse_preprocessed_tiff"]
 PREP_OUTPUT_DIR = "/content/dm4ct_preprocessed"  #@param {type:"string"}
 VALID_EXTENSIONS = ".tif,.tiff,.png,.jpg,.jpeg,.dcm,.ima"  #@param {type:"string"}
@@ -103,22 +104,20 @@ CT_VALUE_MIN = ""  #@param {type:"string"}
 CT_VALUE_MAX = ""  #@param {type:"string"}
 
 # Measurement cache mode:
-# - independent: sample new native-count measurements for this run
-# - shared_counts: load or create a shared native-count cache compatible with
-#   the DM4CT official benchmark notebook when the acquisition matches
-MEASUREMENT_MATCH_MODE = "shared_counts"  #@param ["independent", "shared_counts"]
+# - independent: faithful PDHG run with freshly sampled native counts
+# - shared_counts: comparison-only mode that exports/reuses cached native counts
+#   for cross-framework experiments
+MEASUREMENT_MATCH_MODE = "independent"  #@param ["independent", "shared_counts"]
 
-# This should match MEDICAL_CT_PRESET from the DM4CT notebook if you want the
-# same cache signature. For the PDHG-paper-style native-count benchmark, use
-# the default "custom" together with 80 angles and I0=10000.
+# Comparison-only cache tag. Keep the default "custom" unless you are
+# intentionally exporting counts for a separate comparison notebook.
 DM4CT_CACHE_PRESET_TAG = "custom"  #@param {type:"string"}
 
 # Projector backend:
-# - astra: ASTRA parallel-beam projector with the same geometry family as DM4CT.
-#   In this mode, the notebook also switches the operator attenuation range to
-#   [-1, 1] so the projected values line up with the DM4CT-preprocessed slices.
+# - astra: ASTRA parallel-beam projector while preserving the original PDHG
+#   nonnegative attenuation mapping and count model.
 # - native: original differentiable rotate/sum projector from dyscode
-CT_OPERATOR_BACKEND = "astra"  #@param ["astra", "native"]
+CT_OPERATOR_BACKEND = "native"  #@param ["astra", "native"]
 
 NUM_STEPS = 400  #@param {type:"integer"}
 MAX_ITER = 400  #@param {type:"integer"}
@@ -355,11 +354,11 @@ if local_checkpoint_path:
 else:
     model_ref = HF_MODEL_ID
 
-operator_family = "dm4ct_astra" if CT_OPERATOR_BACKEND == "astra" else "native_counts_rotate_sum"
+operator_family = "pdhg_astra_counts" if CT_OPERATOR_BACKEND == "astra" else "native_counts_rotate_sum"
 
 measurement_cache_root = None
 if MEASUREMENT_MATCH_MODE == "shared_counts":
-    cache_root = Path(DRIVE_MEASUREMENT_CACHE_DIR) if DRIVE_MEASUREMENT_CACHE_DIR.strip() else Path(DRIVE_EXPORT_DIR) / "dm4ct_shared_counts"
+    cache_root = Path(DRIVE_MEASUREMENT_CACHE_DIR) if DRIVE_MEASUREMENT_CACHE_DIR.strip() else Path(DRIVE_EXPORT_DIR) / "pdhg_shared_counts"
     signature_payload = {
         "prepared_root": prepared_root.as_posix(),
         "selected_files": [p.as_posix() for p in prepared_paths],
@@ -390,7 +389,7 @@ print(json.dumps(prep_context, indent=2))
 """
     ),
     code_cell(
-        """#@title Write PDHG Matched-Counts Runner
+        """#@title Write PDHG Benchmark Runner
 import os
 from pathlib import Path
 
@@ -826,12 +825,6 @@ overrides = [
     "model.model_config.local_files_only=" + ("true" if local_checkpoint_path else "false"),
 ]
 
-if CT_OPERATOR_BACKEND == "astra":
-    overrides.extend([
-        "inverse_task.operator.attenuation_min=-1.0",
-        "inverse_task.operator.attenuation_max=1.0",
-    ])
-
 if local_checkpoint_path:
     overrides.append(f"model.model_config.model_id={local_checkpoint_path}")
 else:
@@ -873,7 +866,7 @@ summary = {
     "prepared_paths": prep_context["prepared_paths"],
     "operator_backend": CT_OPERATOR_BACKEND,
     "operator_family": prep_context["operator_family"],
-    "operator_value_range": "[-1, 1]" if CT_OPERATOR_BACKEND == "astra" else "[0, 1]",
+    "attenuation_range": "[0, 1]",
     "measurement_match_mode": MEASUREMENT_MATCH_MODE,
     "measurement_cache_root": prep_context["measurement_cache_root"],
     "num_angles": NUM_ANGLES,
