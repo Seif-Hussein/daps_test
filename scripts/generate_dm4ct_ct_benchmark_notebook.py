@@ -57,6 +57,11 @@ The medical CT acquisition presets follow the DM4CT benchmark setup:
 - `medical_80_noise_ring`
 
 When `MEASUREMENT_MATCH_MODE="shared_counts"`, the notebook samples one cached **native transmission-count** realization per image and derives the DM4CT log measurement from those same counts. This is the fairest bridge to a native-count benchmark.
+
+When `DRIVE_CT_DATA_DIR` is left blank, the notebook defaults to the same tiny raw CT subset and slice selection used by the `mycode2` CT single-run notebook:
+
+- subset: `demo-samples/ct_l067_subset`
+- slice window equivalent to `start_idx = 1`, `end_idx = 2`
 """,
         cell_id="title",
     ),
@@ -96,7 +101,7 @@ MEDICAL_CT_PRESET = "medical_80_more_noise"  #@param ["medical_40_clean", "medic
 
 SEED = 99  #@param {type:"integer"}
 TOTAL_IMAGES = 1  #@param {type:"integer"}
-DATA_START_IDX = 0  #@param {type:"integer"}
+DATA_START_IDX = 1  #@param {type:"integer"}
 LOG_TAIL_LINES = 120  #@param {type:"integer"}
 NUM_WORKERS = 0  #@param {type:"integer"}
 
