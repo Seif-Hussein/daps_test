@@ -56,7 +56,7 @@ The medical CT acquisition presets follow the DM4CT benchmark setup:
 - `medical_80_more_noise`
 - `medical_80_noise_ring`
 
-You can optionally enable a shared-count cache so repeated official DM4CT runs reuse the exact same sampled photon counts.
+When `MEASUREMENT_MATCH_MODE="shared_counts"`, the notebook samples one cached **native transmission-count** realization per image and derives the DM4CT log measurement from those same counts. This is the fairest bridge to a native-count benchmark.
 """,
         cell_id="title",
     ),
@@ -107,9 +107,10 @@ DATA_PREP_MODE = "global_minmax_to_tiff"  #@param ["global_minmax_to_tiff", "reu
 PREP_OUTPUT_DIR = "/content/dm4ct_preprocessed"  #@param {type:"string"}
 VALID_EXTENSIONS = ".tif,.tiff,.png,.jpg,.jpeg,.dcm,.ima"  #@param {type:"string"}
 
-# Optional shared-count mode for repeated official DM4CT runs. This does not change the
-# reconstruction algorithm; it only reuses the same photon-count realization.
-MEASUREMENT_MATCH_MODE = "independent"  #@param ["independent", "shared_counts"]
+# Optional shared-count mode for repeated official DM4CT runs.
+# - independent: official DM4CT noiser path
+# - shared_counts: derive the DM4CT log measurement from one cached native-count realization
+MEASUREMENT_MATCH_MODE = "shared_counts"  #@param ["independent", "shared_counts"]
 
 # Custom acquisition settings used only when MEDICAL_CT_PRESET = "custom".
 CUSTOM_NUM_ANGLES = 80  #@param {type:"integer"}
@@ -426,21 +427,19 @@ class SharedCountPoissonNoise(PoissonNoise):
             return
         torch.save(counts.detach().cpu(), cache_path)
 
-    def forward(self, data: torch.Tensor) -> torch.Tensor:
-        self.scale_factor = self.cal_attenuation_factor(data, self.transmittance_rate)
-        scaled = data * self.scale_factor
-        transmission = torch.exp(-scaled)
+    def _native_count_rate(self, data: torch.Tensor) -> torch.Tensor:
+        return torch.exp(-data).clamp(min=0.0, max=1.0e12) * self.phonton_count
 
-        counts = self._load_cached_counts(transmission)
+    def forward(self, data: torch.Tensor) -> torch.Tensor:
+        counts = self._load_cached_counts(data)
         if counts is None:
-            counts = torch.poisson(transmission * self.phonton_count)
+            counts = torch.poisson(self._native_count_rate(data))
             self._save_cached_counts(counts)
 
         counts = counts.clone()
         counts[counts == 0] = 1
         data = torch.divide(counts, self.phonton_count)
         data = -torch.log(data)
-        data /= self.scale_factor
         return data
 
 
@@ -476,26 +475,24 @@ class SharedCountPoissonNoiseRing(PoissonNoiseRing):
             return
         torch.save(counts.detach().cpu(), cache_path)
 
+    def _native_count_rate(self, data: torch.Tensor) -> torch.Tensor:
+        return torch.exp(-data).clamp(min=0.0, max=1.0e12) * self.phonton_count
+
     def forward(self, data: torch.Tensor) -> torch.Tensor:
         if data.is_cuda:
             torch.cuda.manual_seed_all(self.random_seed)
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
-        self.scale_factor = self.cal_attenuation_factor(data, self.transmittance_rate)
-        scaled = data * self.scale_factor
-        transmission = torch.exp(-scaled)
-
-        counts = self._load_cached_counts(transmission)
+        counts = self._load_cached_counts(data)
         if counts is None:
-            counts = torch.poisson(transmission * self.phonton_count)
+            counts = torch.poisson(self._native_count_rate(data))
             self._save_cached_counts(counts)
 
         counts = counts.clone()
         counts[counts == 0] = 1
         data = torch.divide(counts, self.phonton_count)
         data = -torch.log(data)
-        data /= self.scale_factor
 
         data_std = data.std()
         B, A, W = data.shape
@@ -807,15 +804,9 @@ if MEASUREMENT_MATCH_MODE == "shared_counts":
         "prepared_root": prep_context["prepared_root"],
         "selected_files": prep_context["prepared_paths"],
         "preset": MEDICAL_CT_PRESET,
-        "method": METHOD,
         "seed": int(SEED),
         "num_angles": int(effective["num_angles"]),
-        "noiser": effective["noiser"],
-        "transmittance_rate": float(effective["transmittance_rate"]),
         "photon_count": float(effective["photon_count"]),
-        "bad_pixel_ratio": float(effective["bad_pixel_ratio"]),
-        "ring_scale": float(effective["ring_scale"]),
-        "ring_seed": int(effective["ring_seed"]),
     }
     signature = hashlib.sha1(json.dumps(signature_payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     measurement_cache_root = cache_root / signature
