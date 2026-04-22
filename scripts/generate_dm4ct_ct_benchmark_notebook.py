@@ -58,10 +58,7 @@ The medical CT acquisition presets follow the DM4CT benchmark setup:
 
 When `MEASUREMENT_MATCH_MODE="shared_counts"`, the notebook samples one cached **native transmission-count** realization per image and derives the DM4CT log measurement from those same counts. This is the fairest bridge to a native-count benchmark.
 
-When `DRIVE_CT_DATA_DIR` is left blank, the notebook defaults to the same tiny raw CT subset and slice selection used by the `mycode2` CT single-run notebook:
-
-- subset: `demo-samples/ct_l067_subset`
-- slice window equivalent to `start_idx = 1`, `end_idx = 2`
+When `DRIVE_CT_DATA_DIR` is left blank, the notebook first tries to reuse the CT demo data already available in `mycode2`, preferring the fuller `demo-samples/full_1mm_sharp` tree and then the small `ct_l067_subset` fallback.
 """,
         cell_id="title",
     ),
@@ -292,7 +289,11 @@ if DRIVE_CT_DATA_DIR.strip():
         raise FileNotFoundError(f"CT data root not found: {input_root}")
 else:
     fallback_candidates = [
+        Path("/content/mycode2") / "demo-samples" / "full_1mm_sharp",
+        Path("/content/mycode2") / "demo-samples" / "ct_l067_subset",
+        Path(REPO_DIR) / "demo-samples" / "full_1mm_sharp",
         Path(REPO_DIR) / "demo-samples" / "ct_l067_subset",
+        Path(REPO_DIR) / "demo_samples" / "full_1mm_sharp",
         Path(REPO_DIR) / "demo_samples" / "ct_l067_subset",
     ]
     input_root = next((path for path in fallback_candidates if path.exists()), None)
