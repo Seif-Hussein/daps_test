@@ -292,11 +292,28 @@ else:
     ]
     input_root = next((path for path in fallback_candidates if path.exists()), None)
     if input_root is None:
-        searched = ", ".join(path.as_posix() for path in fallback_candidates)
-        raise ValueError(
-            "DRIVE_CT_DATA_DIR is empty and no repo-safe CT subset was found. "
-            f"Looked in: {searched}"
+        # The official DM4CT repo does not ship the tiny safe CT subset that our
+        # other Colab notebooks use, so fetch the same 3-slice subset from this
+        # support branch when the user leaves DRIVE_CT_DATA_DIR blank.
+        import urllib.request
+
+        support_root = Path("/content/dm4ct_support_subset") / "ct_l067_subset"
+        support_root.mkdir(parents=True, exist_ok=True)
+        base_url = (
+            "https://raw.githubusercontent.com/Seif-Hussein/daps_test/"
+            "codex-reddiff-colab-operators/demo-samples/ct_l067_subset"
         )
+        subset_files = [
+            "ct_slice_009.png",
+            "ct_slice_080.png",
+            "ct_slice_528.png",
+        ]
+        for name in subset_files:
+            dst = support_root / name
+            if not dst.exists():
+                urllib.request.urlretrieve(f"{base_url}/{name}", dst.as_posix())
+
+        input_root = support_root
 
 extensions = _parse_extensions(VALID_EXTENSIONS)
 all_files = _collect_files(input_root, extensions)
