@@ -6,3 +6,4 @@ tensorboard>=2.14
 scipy==1.14.1
 wandb>=0.17,<1
 torchmetrics>=1.4,<2
+pydicom>=2.4,<4

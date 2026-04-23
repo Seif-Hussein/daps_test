@@ -397,6 +397,14 @@ else:
     subprocess.run([PYTHON_BIN, "-m", "pip", "install", "-q", *fallback], check=True)
     print("Installed fallback Colab packages")
 
+try:
+    import pydicom  # noqa: F401
+    print("pydicom ready")
+except ModuleNotFoundError:
+    subprocess.run([PYTHON_BIN, "-m", "pip", "install", "-q", "pydicom>=2.4,<4"], check=True)
+    import pydicom  # noqa: F401
+    print("Installed pydicom")
+
 ffhq_ckpt_id = "1BGwhRWUoguF-D8wlZ65tf227gp3cDUDh"
 repo_dir = Path(REPO_DIR)
 ffhq_ckpt_path = repo_dir / "colab_runs" / "ckpts" / "ffhq" / "ffhq_10m.pt"
