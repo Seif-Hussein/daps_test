@@ -163,6 +163,21 @@ class TransmissionCTNativeCountsH(H_functions):
         frac = (counts.clamp_min(1.0) / i0.clamp_min(1.0)).clamp(min=1.0e-12, max=1.0)
         return -torch.log(frac)
 
+    def _normalize_visual(self, image):
+        flat = image.flatten(1)
+        lo = flat.min(dim=1).values.reshape(-1, 1, 1, 1)
+        hi = flat.max(dim=1).values.reshape(-1, 1, 1, 1)
+        image01 = (image - lo) / (hi - lo).clamp_min(1.0e-8)
+        return image01 * 2.0 - 1.0
+
+    def measurement_visual(self, counts):
+        # The repo's "deg" image is a visual diagnostic, not the tensor optimized
+        # against. Show the log-transformed CT sinogram so it is interpretable.
+        z = self._counts_to_line_integrals(counts)
+        z = self._normalize_visual(z)
+        z = F.interpolate(z, size=(self.img_dim, self.img_dim), mode="bilinear", align_corners=False)
+        return self._repeat_channels(z)
+
     def measurement_loss_per_sample(self, image, counts):
         z = self.line_integrals(image)
         i0 = self.incident_counts(z)
@@ -241,6 +256,12 @@ replace_once(
     "            e_obs = y_0 - H.H(x0_pred)\n            loss_obs = (e_obs**2).mean()/2\n",
     "            if hasattr(H, \"measurement_loss\"):\n                loss_obs = H.measurement_loss(x0_pred, y_0)\n            else:\n                e_obs = y_0 - H.H(x0_pred)\n                loss_obs = (e_obs**2).mean()/2\n",
 )
+
+replace_once(
+    deg_path,
+    "def get_degreadation_image(y_0, H, cfg):\n    c, w = cfg.dataset.channels, cfg.dataset.image_size\n    pinv_y = H.H_pinv(y_0).reshape(-1, c, w, w)\n    return pinv_y\n",
+    "def get_degreadation_image(y_0, H, cfg):\n    c, w = cfg.dataset.channels, cfg.dataset.image_size\n    if hasattr(H, \"measurement_visual\"):\n        return H.measurement_visual(y_0).reshape(-1, c, w, w)\n    pinv_y = H.H_pinv(y_0).reshape(-1, c, w, w)\n    return pinv_y\n",
+)
 '''
 
 
@@ -258,6 +279,7 @@ Important scope:
 
 - This is a same-framework REDDIFF/DPS CT integration notebook.
 - DPS guidance is mapped through `algo.grad_term_weight`; `algo.eta` is kept as DDIM stochasticity.
+- For CT, saved `_deg.png` files visualize the normalized log-sinogram, not the raw count tensor.
 - The default model config is still the RED-diff repo's `ffhq256_uncond` ADM checkpoint path. A compatible CT-trained checkpoint would be needed for a true medical-prior run in this exact framework.
 """,
         cell_id="title",
