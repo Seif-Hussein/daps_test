@@ -99,6 +99,7 @@ def build_progress_state(
     message=None,
     started_at=None,
     elapsed_seconds=None,
+    elapsed_seconds_per_image=None,
 ):
     progress = {
         'status': status,
@@ -119,6 +120,8 @@ def build_progress_state(
         progress['started_at'] = started_at
     if elapsed_seconds is not None:
         progress['elapsed_seconds'] = elapsed_seconds
+    if elapsed_seconds_per_image is not None:
+        progress['elapsed_seconds_per_image'] = elapsed_seconds_per_image
 
     if sigma is not None:
         progress['sigma'] = to_python_scalar(sigma)
@@ -134,7 +137,52 @@ def build_progress_state(
                     'min': metric_value.min().item(),
                     'max': metric_value.max().item(),
                 }
+    if x0y_results:
+        progress['latest_metrics'] = {}
+        for metric_name, metric_value in x0y_results.items():
+            metric_mean = metric_value.detach().cpu().mean().item()
+            progress['latest_metrics'][metric_name] = metric_mean
+            progress[metric_name] = metric_mean
     return progress
+
+
+def build_metric_history_row(
+    *,
+    run_id,
+    step,
+    num_steps,
+    batch_start,
+    batch_end,
+    elapsed_seconds,
+    sigma=None,
+    x0hat_results=None,
+    x0y_results=None,
+):
+    batch_size = batch_end - batch_start
+    row = {
+        'run_id': run_id,
+        'step': step,
+        'max_iter': num_steps,
+        'batch_start': batch_start,
+        'batch_end': batch_end,
+        'batch_size': batch_size,
+        'elapsed_seconds': elapsed_seconds,
+        'elapsed_seconds_per_image': elapsed_seconds / max(batch_size, 1),
+    }
+    if sigma is not None:
+        row['sigma'] = to_python_scalar(sigma)
+
+    # Match the tuning notebooks: top-level metrics track the current corrected
+    # estimate after the inverse-problem update.
+    for metric_name, metric_value in (x0y_results or {}).items():
+        metric_value = metric_value.detach().cpu()
+        row[metric_name] = metric_value.mean().item()
+
+    for metric_name, metric_value in (x0hat_results or {}).items():
+        metric_value = metric_value.detach().cpu()
+        row[f'x0hat_{metric_name}'] = metric_value.mean().item()
+
+    return row
 
 
 def norm(x):
@@ -215,6 +263,7 @@ def sample_in_batch(
     progress_path=None,
     started_at=None,
     run_start_perf_counter=None,
+    metric_history_rows=None,
 ):
     """
         posterior sampling in batch
@@ -229,6 +278,32 @@ def sample_in_batch(
         sampler.progress_callback = None
         if progress_path is not None:
             def progress_callback(payload, batch_start=s, batch_end=min(s + batch_size, len(x_start))):
+                elapsed_seconds = perf_counter() - run_start_perf_counter if run_start_perf_counter is not None else None
+                elapsed_seconds_per_image = None
+                if elapsed_seconds is not None:
+                    elapsed_seconds_per_image = elapsed_seconds / max(batch_end - batch_start, 1)
+
+                if metric_history_rows is not None and elapsed_seconds is not None:
+                    metric_history_rows.append(build_metric_history_row(
+                        run_id=run_id,
+                        step=payload['step'],
+                        num_steps=payload['num_steps'],
+                        batch_start=batch_start,
+                        batch_end=batch_end,
+                        elapsed_seconds=elapsed_seconds,
+                        sigma=payload['sigma'],
+                        x0hat_results=payload.get('x0hat_results'),
+                        x0y_results=payload.get('x0y_results'),
+                    ))
+
+                progress_update_every = max(1, int(args.progress_update_every))
+                is_progress_update = (
+                    payload['step'] % progress_update_every == 0
+                    or payload['step'] == payload['num_steps'] - 1
+                )
+                if not is_progress_update:
+                    return
+
                 progress_state = build_progress_state(
                     args=args,
                     total_images=len(x_start),
@@ -243,8 +318,10 @@ def sample_in_batch(
                     x0y_results=payload.get('x0y_results'),
                     status='running',
                     started_at=started_at,
-                    elapsed_seconds=perf_counter() - run_start_perf_counter if run_start_perf_counter is not None else None,
+                    elapsed_seconds=elapsed_seconds,
+                    elapsed_seconds_per_image=elapsed_seconds_per_image,
                 )
+                progress_state['max_iter'] = payload['num_steps']
                 write_json(progress_path, progress_state)
             sampler.progress_callback = progress_callback
         cur_samples = sampler.sample(
@@ -398,6 +475,7 @@ def main(args):
     save_dir = safe_dir(Path(args.save_dir))
     root = safe_dir(save_dir / args.name)
     progress_path = root / 'progress.json'
+    metric_history_path = root / 'metric_history.json'
     with open(str(root / 'config.yaml'), 'w') as file:
         yaml.safe_dump(OmegaConf.to_container(args, resolve=True), file, default_flow_style=False, allow_unicode=True)
     write_json(progress_path, {
@@ -424,6 +502,7 @@ def main(args):
     # main sampling process
     full_samples = []
     full_trajs = []
+    metric_history_rows = []
     record_metrics = args.save_evolution_metrics
     for r in range(args.num_runs):
         print(f'Run: {r}')
@@ -465,6 +544,7 @@ def main(args):
             progress_path=progress_path,
             started_at=run_started_at,
             run_start_perf_counter=run_start_perf_counter,
+            metric_history_rows=metric_history_rows,
         )
         full_samples.append(samples)
         if trajs is not None:
@@ -484,6 +564,18 @@ def main(args):
     if args.save_evolution_metrics:
         evolution_metrics = summarize_metric_trajectories(full_trajs)
         json.dump(evolution_metrics, open(str(root / 'metrics_evolution.json'), 'w'), indent=4)
+
+    metric_history = {
+        'metric_source': 'x0y',
+        'time_unit': 'seconds',
+        'elapsed_seconds_per_image_definition': 'elapsed_seconds / batch_size',
+        'run_name': args.name,
+        'task_name': args.task[args.task_group].operator.name,
+        'num_runs': args.num_runs,
+        'total_images': total_number,
+        'rows': metric_history_rows,
+    }
+    write_json(metric_history_path, metric_history)
 
     # log grid results
     resized_y = resize(y, images, args.task[args.task_group].operator.name)
@@ -542,6 +634,7 @@ def main(args):
         'task_name': args.task[args.task_group].operator.name,
         'metrics_path': str(root / 'metrics.json'),
         'metrics_evolution_path': str(root / 'metrics_evolution.json'),
+        'metric_history_path': str(metric_history_path),
     })
     print(f'finish {args.name}!')
 

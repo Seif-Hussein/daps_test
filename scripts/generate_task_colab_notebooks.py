@@ -85,6 +85,7 @@ def build_intro(task):
         f"- uses the paper-style per-run step budget for this task: `{task['diffusion_steps']}` ODE / diffusion steps and `{task['annealing_steps']}` annealing steps\n",
         "- saves final metrics to `metrics.json`\n",
         "- saves per-iteration average PSNR / SSIM / LPIPS trajectories to `metrics_evolution.json`\n",
+        "- saves elapsed-time metric history to `metric_history.json`\n",
         "- disables full trajectory tensor saving to avoid Colab RAM growth\n",
         "\n",
         "Before running, switch Colab to a GPU runtime with `Runtime -> Change runtime type -> GPU`.\n",
