@@ -415,6 +415,16 @@ if old_getitem in text:
 dataset_path.write_text(text, encoding="utf-8")
 print("Flat custom dataset can read prepared CT float TIFFs without PNG quantization.")
 
+dataset_init_path = Path(REPO_DIR) / "datasets" / "__init__.py"
+text = dataset_init_path.read_text(encoding="utf-8")
+if 'cfg_dataset.name.startswith("CT_")' not in text:
+    text = text.replace(
+        'if "ImageNet" in cfg_dataset.name:',
+        'if "ImageNet" in cfg_dataset.name or cfg_dataset.name.startswith("CT_"):',
+    )
+dataset_init_path.write_text(text, encoding="utf-8")
+print("Dataset dispatcher can route CT_* datasets through the flat image loader.")
+
 dps_path = Path(REPO_DIR) / "algos" / "dps.py"
 replace_once(
     dps_path,
@@ -784,6 +794,7 @@ run_cmd = [
     "-cn",
     BASE_CONFIG_NAME,
     "dataset=drive_ct_512",
+    "dataset.name=ImageNet_CT_Drive_512x512",
     f"dataset.root={prepared_root.as_posix()}",
     f"dataset.subset_txt={subset_path.as_posix()}",
     f"algo={ALGO_NAME}",
