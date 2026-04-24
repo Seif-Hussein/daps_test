@@ -24,6 +24,7 @@ class DPS(DDIM):
 
     def sample(self, x, y, ts, **kwargs):
         y_0 = kwargs["y_0"]
+        metric_callback = kwargs.get("metric_callback")
         n = x.size(0)
         H = self.H
     
@@ -33,7 +34,8 @@ class DPS(DDIM):
         x0_s = []
 
         xt = x
-        for ti, si in zip(reversed(ts), reversed(ss)):
+        max_iter = len(ts)
+        for step, (ti, si) in enumerate(zip(reversed(ts), reversed(ss)), start=1):
             t = torch.ones(n).to(x.device).long() * ti
             s = torch.ones(n).to(x.device).long() * si
             alpha_t = self.diffusion.alpha(t).view(-1, 1, 1, 1)
@@ -63,6 +65,8 @@ class DPS(DDIM):
             xs = alpha_s.sqrt() * x0_pred.detach() + c1 * torch.randn_like(xt) + c2 * et.detach() - grad_term * coeff
             xt_s.append(xs.detach().cpu())
             x0_s.append(x0_pred.detach().cpu())
+            if metric_callback is not None:
+                metric_callback(step=step, sample=xs.detach(), max_iter=max_iter, timestep=int(ti))
             xt = xs
 
         return list(reversed(xt_s)), list(reversed(x0_s))

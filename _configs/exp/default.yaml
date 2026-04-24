@@ -16,6 +16,8 @@ save_deg: False
 seed: 1
 write_progress_json: True
 progress_json: "progress.json"
+progress_json_every: 1
 write_metrics_history_json: True
-metrics_history_json: "metrics_history.json"
+metrics_history_json: "metric_history.json"
+sampling_metric_every: 1
 name: ???

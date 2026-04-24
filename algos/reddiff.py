@@ -32,6 +32,7 @@ class REDDIFF(DDIM):
 
     def sample(self, x, y, ts, **kwargs):
         y_0 = kwargs["y_0"]
+        metric_callback = kwargs.get("metric_callback")
         sigma_y = self.cfg.algo.sigma_y
         n = x.size(0)
         H = self.H
@@ -52,7 +53,8 @@ class REDDIFF(DDIM):
         optimizer = torch.optim.Adam([mu], lr=self.lr, betas=(0.9, 0.99), weight_decay=0.0)   #original: 0.999
         #optimizer = torch.optim.SGD([mu], lr=1e6, momentum=0.9)  #momentum=0.9
 
-        for ti, si in zip(reversed(ts), reversed(ss)):
+        max_iter = len(ts)
+        for step, (ti, si) in enumerate(zip(reversed(ts), reversed(ss)), start=1):
             
             
             t = torch.ones(n).to(x.device).long() * ti
@@ -114,6 +116,8 @@ class REDDIFF(DDIM):
             optimizer.zero_grad()  #initialize
             loss.backward()
             optimizer.step()
+            if metric_callback is not None:
+                metric_callback(step=step, sample=x0_pred.detach(), max_iter=max_iter, timestep=int(ti))
             
             # #save for visualization
             if self.cfg.exp.save_evolution:
