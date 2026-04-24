@@ -340,7 +340,7 @@ torch_dtype: float32
 """, encoding="utf-8")
 
 (configs_root / "dataset" / "drive_ct_512.yaml").write_text("""# Colab-prepared CT float TIFFs.
-name: "CT_Drive_512x512"
+name: "ImageNet_CT_Drive_512x512"
 root: "/content/reddiff_ct_native_preprocessed"
 split: "custom"
 image_size: 512
