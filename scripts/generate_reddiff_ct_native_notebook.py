@@ -243,6 +243,178 @@ if 'elif deg in {"transmission_ct_native", "ct_native_counts"}:' not in text:
 deg_path.write_text(text, encoding="utf-8")
 print(f"Native CT degradation ready in {deg_path}")
 
+dm4ct_model_path = Path(REPO_DIR) / "models" / "dm4ct_diffusers.py"
+dm4ct_model_path.write_text(r"""
+import torch
+import torch.nn as nn
+
+
+class DM4CTDiffusersUNet(nn.Module):
+    # Diffusers DDPM UNet adapter for the RED-diff repo model API.
+
+    def __init__(self, model_id, local_files_only=False, torch_dtype="float32"):
+        super().__init__()
+        try:
+            from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+        except ImportError as exc:
+            raise ImportError("Install diffusers to use the DM4CT checkpoint.") from exc
+
+        dtype = getattr(torch, str(torch_dtype)) if torch_dtype else None
+        load_kwargs = {"local_files_only": bool(local_files_only)}
+        if dtype is not None:
+            load_kwargs["torch_dtype"] = dtype
+
+        errors = []
+        try:
+            pipe = DDPMPipeline.from_pretrained(model_id, **load_kwargs)
+            self.unet = pipe.unet
+            self.scheduler = pipe.scheduler
+        except Exception as exc:
+            errors.append(f"DDPMPipeline: {exc}")
+            try:
+                self.unet = UNet2DModel.from_pretrained(model_id, subfolder="unet", **load_kwargs)
+                self.scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
+            except Exception as sub_exc:
+                errors.append(f"unet/scheduler subfolders: {sub_exc}")
+                try:
+                    self.unet = UNet2DModel.from_pretrained(model_id, **load_kwargs)
+                    self.scheduler = DDPMScheduler(num_train_timesteps=1000)
+                except Exception as bare_exc:
+                    errors.append(f"bare UNet2DModel: {bare_exc}")
+                    raise RuntimeError("Could not load DM4CT diffusers checkpoint:\n" + "\n".join(errors)) from bare_exc
+
+        config = getattr(self.unet, "config", None)
+        self.model_in_channels = int(getattr(config, "in_channels", 1))
+        self.model_out_channels = int(getattr(config, "out_channels", self.model_in_channels))
+
+    @staticmethod
+    def _match_channels(x, channels):
+        if x.shape[1] == channels:
+            return x
+        if channels == 1:
+            return x.mean(dim=1, keepdim=True)
+        if x.shape[1] > channels:
+            return x[:, :channels]
+        if x.shape[1] == 1:
+            return x.repeat(1, channels, 1, 1)
+        if channels % x.shape[1] == 0:
+            return x.repeat(1, channels // x.shape[1], 1, 1)
+        return x.mean(dim=1, keepdim=True).repeat(1, channels, 1, 1)
+
+    def forward(self, x, timesteps, y=None):
+        x_model = self._match_channels(x, self.model_in_channels)
+        out = self.unet(x_model, timesteps).sample
+        return self._match_channels(out, x.shape[1])
+""", encoding="utf-8")
+print(f"Wrote DM4CT diffusers model adapter to {dm4ct_model_path}")
+
+model_init_path = Path(REPO_DIR) / "models" / "__init__.py"
+text = model_init_path.read_text(encoding="utf-8")
+old_model_load = """    model_ckpt = ckpt_path_adm(cfg.model.ckpt, cfg)
+    logger.info(f"Loading model from {model_ckpt}..")
+    model.load_state_dict(torch.load(model_ckpt, map_location=map_location), strict=False)
+    print('asdas')
+"""
+new_model_load = """    if getattr(cfg.model, "ckpt", None):
+        model_ckpt = ckpt_path_adm(cfg.model.ckpt, cfg)
+        logger.info(f"Loading model from {model_ckpt}..")
+        model.load_state_dict(torch.load(model_ckpt, map_location=map_location), strict=False)
+    else:
+        logger.info("Using model object without ADM checkpoint loading.")
+"""
+if old_model_load in text:
+    text = text.replace(old_model_load, new_model_load, 1)
+model_init_path.write_text(text, encoding="utf-8")
+print("Model builder can use DM4CT diffusers checkpoints without ADM ckpt loading.")
+
+configs_root = Path(REPO_DIR) / "_configs"
+(configs_root / "model").mkdir(parents=True, exist_ok=True)
+(configs_root / "dataset").mkdir(parents=True, exist_ok=True)
+
+dm4ct_model_ref_yaml = str(DM4CT_MODEL_REF).replace("'", "''")
+(configs_root / "model" / "dm4ct_lodochallenge_pixel.yaml").write_text(f"""# Runtime Colab config for the DM4CT LODO pixel-space CT prior.
+_target_: models.dm4ct_diffusers.DM4CTDiffusersUNet
+model_id: '{dm4ct_model_ref_yaml}'
+local_files_only: false
+torch_dtype: float32
+""", encoding="utf-8")
+
+(configs_root / "dataset" / "drive_ct_512.yaml").write_text("""# Colab-prepared CT float TIFFs.
+name: "CT_Drive_512x512"
+root: "/content/reddiff_ct_native_preprocessed"
+split: "custom"
+image_size: 512
+channels: 3
+meta_root: ""
+transform: "diffusion"
+subset_txt: ""
+""", encoding="utf-8")
+
+(configs_root / "dm4ct_ct512_uncond.yaml").write_text("""# RED-diff/DPS with the DM4CT CT prior and 512x512 CT slices.
+defaults:
+- dataset: drive_ct_512
+- loader: imagenet256_ddrm
+- model: dm4ct_lodochallenge_pixel
+- classifier: none
+- dist: localhost
+- exp: default
+- diffusion: linear1000
+- algo: ddim
+- _self_
+""", encoding="utf-8")
+print("Wrote DM4CT CT 512 configs.")
+
+dataset_path = Path(REPO_DIR) / "datasets" / "imagenet.py"
+text = dataset_path.read_text(encoding="utf-8")
+if "def _load_ct_float_tiff_tensor" not in text:
+    marker = "\n\nclass FlatImageDataset(Dataset):\n"
+    helper = r"""
+
+def _load_ct_float_tiff_tensor(path: str) -> torch.Tensor:
+    arr = np.asarray(Image.open(path), dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    if arr.size == 0:
+        raise ValueError(f"Empty CT TIFF: {path}")
+    finite = np.isfinite(arr)
+    if not finite.all():
+        arr = np.where(finite, arr, 0.0)
+    if float(np.nanmin(arr)) < -0.01:
+        arr = (arr + 1.0) * 0.5
+    elif float(np.nanmax(arr)) > 1.01:
+        max_val = 65535.0 if float(np.nanmax(arr)) > 255.0 else 255.0
+        arr = arr / max_val
+    arr = np.clip(arr, 0.0, 1.0).astype(np.float32)
+    tensor = torch.from_numpy(arr).unsqueeze(0)
+    return tensor.repeat(3, 1, 1)
+"""
+    text = text.replace(marker, helper + marker, 1)
+old_getitem = """    def __getitem__(self, index: int):
+        path, target = self.samples[index]
+        sample = self.loader(path)
+        if self.transform is not None:
+            sample = self.transform(sample)
+
+        name = os.path.splitext(os.path.basename(path))[0]
+        return sample, target, {"class_id": self.class_id, "name": name, "index": index}
+"""
+new_getitem = """    def __getitem__(self, index: int):
+        path, target = self.samples[index]
+        if path.lower().endswith((\".tif\", \".tiff\")):
+            sample = _load_ct_float_tiff_tensor(path)
+        else:
+            sample = self.loader(path)
+            if self.transform is not None:
+                sample = self.transform(sample)
+
+        name = os.path.splitext(os.path.basename(path))[0]
+        return sample, target, {\"class_id\": self.class_id, \"name\": name, \"index\": index}
+"""
+if old_getitem in text:
+    text = text.replace(old_getitem, new_getitem, 1)
+dataset_path.write_text(text, encoding="utf-8")
+print("Flat custom dataset can read prepared CT float TIFFs without PNG quantization.")
+
 dps_path = Path(REPO_DIR) / "algos" / "dps.py"
 replace_once(
     dps_path,
@@ -278,9 +450,10 @@ The CT measurement model is the same class of model as the PDHG formulation:
 Important scope:
 
 - This is a same-framework REDDIFF/DPS CT integration notebook.
+- The default data path uses the original L067 `.IMA` CT slices and prepares float TIFFs.
+- The default model path uses the DM4CT/LodoChallenge pixel-space CT diffusers checkpoint.
 - DPS guidance is mapped through `algo.grad_term_weight`; `algo.eta` is kept as DDIM stochasticity.
 - For CT, saved `_deg.png` files visualize the normalized log-sinogram, not the raw count tensor.
-- The default model config is still the RED-diff repo's `ffhq256_uncond` ADM checkpoint path. A compatible CT-trained checkpoint would be needed for a true medical-prior run in this exact framework.
 """,
         cell_id="title",
     ),
@@ -296,11 +469,11 @@ REPO_DIR = "/content/RED-diff"  #@param {type:"string"}
 PYTHON_BIN = "/usr/bin/python3"  #@param {type:"string"}
 DRIVE_EXPORT_DIR = "/content/drive/MyDrive/reddiff_ct_native_single_run_exports"  #@param {type:"string"}
 DRIVE_CT_DATA_DIR = ""  #@param {type:"string"}
-DRIVE_FFHQ_CKPT_PATH = ""  #@param {type:"string"}
+DM4CT_MODEL_REF = "jiayangshi/lodochallenge_pixel_diffusion"  #@param {type:"string"}
 
 RUN_NAME = "REDDiff_DPS_CT_Native_Counts"  #@param {type:"string"}
 SESSION_TAG = ""  #@param {type:"string"}
-BASE_CONFIG_NAME = "ffhq256_uncond"  #@param ["ffhq256_uncond"]
+BASE_CONFIG_NAME = "dm4ct_ct512_uncond"  #@param ["dm4ct_ct512_uncond"]
 ALGO_NAME = "dps"  #@param ["dps", "reddiff"]
 
 SEED = 99  #@param {type:"integer"}
@@ -309,6 +482,8 @@ BATCH_SIZE = 1  #@param {type:"integer"}
 DATA_START_IDX = 0  #@param {type:"integer"}
 NUM_WORKERS = 0  #@param {type:"integer"}
 LOG_TAIL_LINES = 120  #@param {type:"integer"}
+SAMPLING_METRIC_EVERY = 1  #@param {type:"integer"}
+PROGRESS_JSON_EVERY = 1  #@param {type:"integer"}
 
 PREP_OUTPUT_DIR = "/content/reddiff_ct_native_preprocessed"  #@param {type:"string"}
 CT_VALUE_MIN = ""  #@param {type:"string"}
@@ -321,7 +496,7 @@ NUM_STEPS = 1000  #@param {type:"integer"}
 # Native-count CT acquisition.
 I0 = 10000.0  #@param {type:"number"}
 NUM_ANGLES = 80  #@param {type:"integer"}
-NUM_DETECTORS = 256  #@param {type:"integer"}
+NUM_DETECTORS = 512  #@param {type:"integer"}
 ATTENUATION_MIN = 0.0  #@param {type:"number"}
 ATTENUATION_MAX = 1.0  #@param {type:"number"}
 CT_LOSS_REDUCTION = "mean"  #@param ["mean", "sum"]
@@ -415,6 +590,8 @@ else:
         "scipy==1.14.1",
         "torchmetrics>=1.4,<2",
         "pydicom>=2.4,<4",
+        "diffusers>=0.27,<1",
+        "accelerate>=0.29,<1",
     ]
     subprocess.run([PYTHON_BIN, "-m", "pip", "install", "-q", *fallback], check=True)
     print("Installed fallback Colab packages")
@@ -427,24 +604,15 @@ except ModuleNotFoundError:
     import pydicom  # noqa: F401
     print("Installed pydicom")
 
-ffhq_ckpt_id = "1BGwhRWUoguF-D8wlZ65tf227gp3cDUDh"
-repo_dir = Path(REPO_DIR)
-ffhq_ckpt_path = repo_dir / "colab_runs" / "ckpts" / "ffhq" / "ffhq_10m.pt"
-ffhq_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-drive_ckpt_path = Path(DRIVE_FFHQ_CKPT_PATH) if str(DRIVE_FFHQ_CKPT_PATH).strip() else None
-legacy_ckpt_path = repo_dir / "pretrained-models" / "ffhq_10m.pt"
+try:
+    import diffusers  # noqa: F401
+    print("diffusers ready")
+except ModuleNotFoundError:
+    subprocess.run([PYTHON_BIN, "-m", "pip", "install", "-q", "diffusers>=0.27,<1", "accelerate>=0.29,<1"], check=True)
+    import diffusers  # noqa: F401
+    print("Installed diffusers")
 
-if ffhq_ckpt_path.exists():
-    print(f"Checkpoint already present: {ffhq_ckpt_path}")
-elif drive_ckpt_path is not None and drive_ckpt_path.exists():
-    shutil.copy2(drive_ckpt_path, ffhq_ckpt_path)
-    print(f"Copied checkpoint from Drive to: {ffhq_ckpt_path}")
-elif legacy_ckpt_path.exists():
-    shutil.copy2(legacy_ckpt_path, ffhq_ckpt_path)
-    print(f"Copied checkpoint from repo cache to: {ffhq_ckpt_path}")
-else:
-    subprocess.run(["gdown", "--id", ffhq_ckpt_id, "-O", ffhq_ckpt_path.as_posix()], check=True)
-    print(f"Downloaded checkpoint to: {ffhq_ckpt_path}")
+print(f"DM4CT model reference: {DM4CT_MODEL_REF}")
 """,
         cell_id="install",
     ),
@@ -482,7 +650,30 @@ def _load_ct_array(path: Path) -> np.ndarray:
 if DRIVE_CT_DATA_DIR.strip():
     input_root = Path(DRIVE_CT_DATA_DIR)
 else:
-    input_root = Path(REPO_DIR) / "demo-samples" / "ct_l067_original_ima_subset"
+    fallback_candidates = [
+        Path(REPO_DIR) / "demo-samples" / "ct_l067_original_ima_subset",
+        Path(REPO_DIR) / "demo_samples" / "ct_l067_original_ima_subset",
+    ]
+    input_root = next((path for path in fallback_candidates if path.exists()), None)
+    if input_root is None:
+        import urllib.request
+
+        support_root = Path("/content/dm4ct_support_subset") / "ct_l067_original_ima_subset"
+        support_root.mkdir(parents=True, exist_ok=True)
+        base_url = (
+            "https://raw.githubusercontent.com/Seif-Hussein/daps_test/"
+            "codex-reddiff-colab-operators/demo-samples/ct_l067_original_ima_subset"
+        )
+        subset_files = [
+            "L067_FD_1_SHARP_1.CT.0002.0009.2016.01.21.18.11.40.977560.404629207.IMA",
+            "L067_FD_1_SHARP_1.CT.0002.0080.2016.01.21.18.11.40.977560.404630911.IMA",
+            "L067_FD_1_SHARP_1.CT.0002.0528.2016.01.21.18.11.40.977560.404644046.IMA",
+        ]
+        for name in subset_files:
+            dst = support_root / name
+            if not dst.exists():
+                urllib.request.urlretrieve(f"{base_url}/{name}", dst.as_posix())
+        input_root = support_root
 
 if not input_root.exists():
     raise FileNotFoundError(f"CT data folder not found: {input_root}")
@@ -519,11 +710,20 @@ prepared = []
 for idx, src in enumerate(selected_files):
     arr = _load_ct_array(src)
     arr01 = ((arr - value_min) / (value_max - value_min)).clip(0.0, 1.0)
-    uint8 = (arr01 * 255.0 + 0.5).astype(np.uint8)
-    pil = Image.fromarray(uint8, mode="L").resize((256, 256), Image.BICUBIC).convert("RGB")
-    out = prep_root / f"ct_{idx:05d}_{src.stem}.png"
+    pil = Image.fromarray(arr01.astype(np.float32), mode="F").resize((512, 512), Image.BICUBIC)
+    out = prep_root / f"ct_{idx:05d}_{src.stem}.tif"
     pil.save(out)
     prepared.append(out)
+
+manifest = {
+    "input_root": input_root.as_posix(),
+    "selected_files": [path.as_posix() for path in selected_files],
+    "prepared_files": [path.as_posix() for path in prepared],
+    "ct_value_min": float(value_min),
+    "ct_value_max": float(value_max),
+    "prepared_format": "float32_tiff_0_1",
+}
+(prep_root / "source_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 print("Prepared CT slices:")
 for path in prepared:
@@ -566,13 +766,13 @@ subset_root.mkdir(parents=True, exist_ok=True)
 subset_path = subset_root / f"{run_slug}.txt"
 
 prepared_root = Path(PREP_OUTPUT_DIR)
-prepared_files = sorted(prepared_root.glob("*.png"))
+prepared_files = sorted(prepared_root.glob("*.tif"))
 subset_path.write_text("".join(f"{path.name} 0\\n" for path in prepared_files), encoding="utf-8")
 
 exp_root = run_aux_root
 samples_root = exp_root / "samples" / run_slug
 progress_path = samples_root / "progress.json"
-metrics_history_path = samples_root / "metrics_history.json"
+metric_history_path = samples_root / "metric_history.json"
 latest_log_path = run_aux_root / f"{run_slug}.log"
 latest_pid_path = run_aux_root / f"{run_slug}.pid"
 
@@ -583,7 +783,7 @@ run_cmd = [
     "main.py",
     "-cn",
     BASE_CONFIG_NAME,
-    "dataset=drive_images_256",
+    "dataset=drive_ct_512",
     f"dataset.root={prepared_root.as_posix()}",
     f"dataset.subset_txt={subset_path.as_posix()}",
     f"algo={ALGO_NAME}",
@@ -598,8 +798,10 @@ run_cmd = [
     f"exp.num_steps={NUM_STEPS}",
     "exp.write_progress_json=true",
     "exp.progress_json=progress.json",
+    f"exp.progress_json_every={max(1, int(PROGRESS_JSON_EVERY))}",
     "exp.write_metrics_history_json=true",
-    "exp.metrics_history_json=metrics_history.json",
+    "exp.metrics_history_json=metric_history.json",
+    f"exp.sampling_metric_every={max(1, int(SAMPLING_METRIC_EVERY))}",
     f"exp.save_ori={'true' if SAVE_ORI else 'false'}",
     f"exp.save_deg={'true' if SAVE_DEG else 'false'}",
     f"exp.save_evolution={'true' if SAVE_EVOLUTION else 'false'}",
@@ -652,6 +854,7 @@ else:
     print(f"REDDIFF obs weight: {REDDIFF_OBS_WEIGHT}")
 print(f"Samples root: {samples_root}")
 print(f"Progress JSON: {progress_path}")
+print(f"Metric history JSON: {metric_history_path}")
 print("\\nCommand:")
 print(" ".join(shlex.quote(part) for part in run_cmd))
 
@@ -659,7 +862,8 @@ run_context = {
     "run_slug": run_slug,
     "samples_root": samples_root.as_posix(),
     "progress_path": progress_path.as_posix(),
-    "metrics_history_path": metrics_history_path.as_posix(),
+    "metric_history_path": metric_history_path.as_posix(),
+    "metrics_history_path": metric_history_path.as_posix(),
     "latest_log_path": latest_log_path.as_posix(),
     "latest_pid_path": latest_pid_path.as_posix(),
     "run_cmd": run_cmd,
@@ -696,26 +900,43 @@ from pathlib import Path
 
 samples_root = Path(run_context["samples_root"])
 progress_path = Path(run_context["progress_path"])
-history_path = Path(run_context["metrics_history_path"])
+history_path = Path(run_context["metric_history_path"])
 log_path = Path(run_context["latest_log_path"])
 
 print(f"samples_root: {samples_root}")
 print(f"progress.json: {progress_path.exists()}")
-print(f"metrics_history.json: {history_path.exists()}")
+print(f"metric_history.json: {history_path.exists()}")
+
+def _metric_history_rows(history):
+    keys = ["step", "elapsed_seconds_per_image", "psnr", "ssim", "lpips"]
+    if all(isinstance(history.get(key), list) for key in keys):
+        count = len(history["step"])
+        return [
+            {key: history[key][idx] if idx < len(history[key]) else None for key in keys}
+            for idx in range(count)
+        ]
+    return history.get("entries", [])
+
+def _subsample_rows(rows, limit=25):
+    if len(rows) <= limit:
+        return rows
+    if limit <= 1:
+        return rows[-1:]
+    indices = sorted({round(i * (len(rows) - 1) / (limit - 1)) for i in range(limit)})
+    return [rows[idx] for idx in indices]
 
 if history_path.exists():
     history = json.loads(history_path.read_text(encoding="utf-8"))
-    print("\\nmetrics_history.json:")
-    entries = history.get("entries", [])
-    if entries:
-        last = entries[-1]
-        print(json.dumps({
-            "status": history.get("status"),
-            "mean_psnr": last.get("mean_psnr"),
-            "mean_ssim": last.get("mean_ssim"),
-            "mean_lpips": last.get("mean_lpips"),
-            "completed_images": last.get("completed_images"),
-        }, indent=2))
+    rows = _metric_history_rows(history)
+    print("\\nmetric_history.json:")
+    print(json.dumps({
+        "status": history.get("status"),
+        "full_history_rows": len(rows),
+        "summary": history.get("summary"),
+    }, indent=2))
+    if rows:
+        print("\\nDisplayed rows are subsampled from the full metric_history.json:")
+        print(json.dumps(_subsample_rows(rows), indent=2))
     else:
         print(json.dumps(history, indent=2)[:4000])
 
