@@ -219,7 +219,7 @@ def main(cfg):
         return None
 
     def _make_sampling_metric_callback(target, batch_size, batch_index, max_iter, info):
-        if not write_metric_history or cfg.algo.name not in {"dps", "reddiff"}:
+        if not write_metric_history or cfg.algo.name not in {"dps", "dps_nonlinear", "reddiff"}:
             return None
         if dist.get_rank() != 0:
             return None

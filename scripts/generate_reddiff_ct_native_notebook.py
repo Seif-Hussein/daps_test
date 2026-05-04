@@ -204,6 +204,105 @@ class TransmissionCTNativeCountsH(H_functions):
 '''
 
 
+DPS_NONLINEAR_CODE = r'''# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved
+
+import torch
+from omegaconf import DictConfig
+
+from models.classifier_guidance_model import ClassifierGuidanceModel
+from utils.degredations import build_degredation_model
+from .ddim import DDIM
+
+
+class DPSNonlinear(DDIM):
+    """DPS with nonlinear Poisson CT likelihood guidance."""
+
+    def __init__(self, model: ClassifierGuidanceModel, cfg: DictConfig):
+        self.model = model
+        self.diffusion = model.diffusion
+        self.H = build_degredation_model(cfg)
+        self.cfg = cfg
+        self.awd = cfg.algo.awd
+        self.cond_awd = cfg.algo.cond_awd
+        self.eta = cfg.algo.eta
+        self.likelihood_weight = float(
+            getattr(cfg.algo, "likelihood_weight", getattr(cfg.algo, "grad_term_weight", 310.0))
+        )
+        self.gradient_eps = float(getattr(cfg.algo, "gradient_eps", 1.0e-12))
+        self.init_mode = str(getattr(cfg.algo, "init_mode", "noise"))
+
+    def sample(self, x, y, ts, **kwargs):
+        y_0 = kwargs["y_0"]
+        metric_callback = kwargs.get("metric_callback")
+        n = x.size(0)
+        H = self.H
+
+        x = self.initialize(x, y, ts, y_0=y_0)
+        ss = [-1] + list(ts[:-1])
+        xt_s = [x.detach().cpu()]
+        x0_s = []
+
+        xt = x
+        max_iter = len(ts)
+        for step, (ti, si) in enumerate(zip(reversed(ts), reversed(ss)), start=1):
+            t = torch.ones(n).to(x.device).long() * ti
+            s = torch.ones(n).to(x.device).long() * si
+            alpha_t = self.diffusion.alpha(t).view(-1, 1, 1, 1)
+            alpha_s = self.diffusion.alpha(s).view(-1, 1, 1, 1)
+            c1 = ((1 - alpha_t / alpha_s) * (1 - alpha_s) / (1 - alpha_t)).sqrt() * self.eta
+            c2 = ((1 - alpha_s) - c1 ** 2).sqrt()
+            xt = xt.clone().to(x.device).requires_grad_(True)
+
+            if self.cond_awd:
+                scale = alpha_s.sqrt() / (
+                    alpha_s.sqrt() - c2 * alpha_t.sqrt() / (1 - alpha_t).sqrt()
+                )
+                scale = scale.view(-1)[0].item()
+            else:
+                scale = 1.0
+
+            et, x0_pred = self.model(xt, y, t, scale=scale)
+            if not self.awd:
+                et = (xt - x0_pred * alpha_t.sqrt()) / (1 - alpha_t).sqrt()
+
+            if not hasattr(H, "measurement_loss_per_sample"):
+                raise RuntimeError(
+                    "DPSNonlinear requires a CT operator with measurement_loss_per_sample()."
+                )
+
+            nll_per_sample = H.measurement_loss_per_sample(x0_pred, y_0)
+            nll = nll_per_sample.sum()
+            grad_nll = torch.autograd.grad(nll, xt, retain_graph=False)[0]
+            grad_nll = grad_nll.detach()
+
+            grad_norm_sq = grad_nll.flatten(1).pow(2).sum(dim=1)
+            coeff = self.likelihood_weight / grad_norm_sq.clamp_min(self.gradient_eps)
+            coeff = coeff.reshape(-1, 1, 1, 1)
+
+            xs = (
+                alpha_s.sqrt() * x0_pred.detach()
+                + c1 * torch.randn_like(xt)
+                + c2 * et.detach()
+                - coeff * grad_nll
+            )
+            xt_s.append(xs.detach().cpu())
+            x0_s.append(x0_pred.detach().cpu())
+            if metric_callback is not None:
+                metric_callback(step=step, sample=xs.detach(), max_iter=max_iter, timestep=int(ti))
+            xt = xs.detach()
+
+        return list(reversed(xt_s)), list(reversed(x0_s))
+
+    def initialize(self, x, y, ts, **kwargs):
+        if self.init_mode == "pinv":
+            y_0 = kwargs["y_0"]
+            return self.H.H_pinv(y_0).view(*x.size()).detach()
+        if self.init_mode != "noise":
+            raise ValueError(f"Unsupported DPSNonlinear init_mode: {self.init_mode}")
+        return torch.randn_like(x)
+'''
+
+
 PATCH_CELL = r'''#@title Patch RED-diff Repo With Native-Count CT
 import os
 from pathlib import Path
@@ -330,6 +429,7 @@ print("Model builder can use DM4CT diffusers checkpoints without ADM ckpt loadin
 configs_root = Path(REPO_DIR) / "_configs"
 (configs_root / "model").mkdir(parents=True, exist_ok=True)
 (configs_root / "dataset").mkdir(parents=True, exist_ok=True)
+(configs_root / "algo").mkdir(parents=True, exist_ok=True)
 
 dm4ct_model_ref_yaml = str(DM4CT_MODEL_REF).replace("'", "''")
 (configs_root / "model" / "dm4ct_lodochallenge_pixel.yaml").write_text(f"""# Runtime Colab config for the DM4CT LODO pixel-space CT prior.
@@ -425,6 +525,64 @@ if 'cfg_dataset.name.startswith("CT_")' not in text:
 dataset_init_path.write_text(text, encoding="utf-8")
 print("Dataset dispatcher can route CT_* datasets through the flat image loader.")
 
+dps_nonlinear_path = Path(REPO_DIR) / "algos" / "dps_nonlinear.py"
+dps_nonlinear_path.write_text(DPS_NONLINEAR_CODE, encoding="utf-8")
+print(f"Wrote DPS Nonlinear CT algorithm to {dps_nonlinear_path}")
+
+algo_init_path = Path(REPO_DIR) / "algos" / "__init__.py"
+text = algo_init_path.read_text(encoding="utf-8")
+if "from .dps_nonlinear import DPSNonlinear" not in text:
+    text = text.replace("from .dps import DPS\n", "from .dps import DPS\nfrom .dps_nonlinear import DPSNonlinear\n", 1)
+if "cfg.algo.name == 'dps_nonlinear'" not in text:
+    text = text.replace(
+        "    elif cfg.algo.name == 'dps':\n        return DPS(cg_model, cfg)\n",
+        "    elif cfg.algo.name == 'dps':\n        return DPS(cg_model, cfg)\n    elif cfg.algo.name == 'dps_nonlinear':\n        return DPSNonlinear(cg_model, cfg)\n",
+        1,
+    )
+algo_init_path.write_text(text, encoding="utf-8")
+print("Algorithm builder can instantiate dps_nonlinear.")
+
+(configs_root / "algo" / "dps_nonlinear.yaml").write_text("""# Runtime Colab config for DPS Nonlinear CT.
+name: "dps_nonlinear"
+deg: "transmission_ct_native"
+awd: True
+cond_awd: False
+sigma_y: 0.0
+eta: 0.0
+likelihood_weight: 310.0
+gradient_eps: 1.0e-12
+init_mode: "noise"
+operator:
+  sigma: 0.0
+  scale_factor: 4
+  kernel_size: 61
+  gaussian_intensity: 3.0
+  motion_intensity: 0.5
+  oversample: 2.0
+  hdr_scale: 2.0
+  mask_len_range: [128, 129]
+  mask_prob_range: [0.70, 0.71]
+  margin: [32, 32]
+  box_start: null
+  box_mask_len: null
+  I0: 10000.0
+  num_angles: 80
+  num_detectors: 512
+  attenuation_min: 0.0
+  attenuation_max: 1.0
+  loss_reduction: "sum"
+""", encoding="utf-8")
+print("Wrote DPS Nonlinear config.")
+
+main_path = Path(REPO_DIR) / "main.py"
+text = main_path.read_text(encoding="utf-8")
+text = text.replace(
+    'cfg.algo.name not in {"dps", "reddiff"}',
+    'cfg.algo.name not in {"dps", "dps_nonlinear", "reddiff"}',
+)
+main_path.write_text(text, encoding="utf-8")
+print("Metric history is enabled for dps_nonlinear.")
+
 dps_path = Path(REPO_DIR) / "algos" / "dps.py"
 replace_once(
     dps_path,
@@ -462,7 +620,8 @@ Important scope:
 - This is a same-framework REDDIFF/DPS CT integration notebook.
 - The default data path uses the original L067 `.IMA` CT slices and prepares float TIFFs.
 - The default model path uses the DM4CT/LodoChallenge pixel-space CT diffusers checkpoint.
-- DPS guidance is mapped through `algo.grad_term_weight`; `algo.eta` is kept as DDIM stochasticity.
+- `dps_nonlinear` implements the nonlinear Poisson-likelihood DPS update from Li et al. (2312.01464v2).
+- Vanilla DPS guidance is mapped through `algo.grad_term_weight`; `algo.eta` is kept as DDIM stochasticity.
 - For CT, saved `_deg.png` files visualize the normalized log-sinogram, not the raw count tensor.
 """,
         cell_id="title",
@@ -484,7 +643,7 @@ DM4CT_MODEL_REF = "jiayangshi/lodochallenge_pixel_diffusion"  #@param {type:"str
 RUN_NAME = "REDDiff_DPS_CT_Native_Counts"  #@param {type:"string"}
 SESSION_TAG = ""  #@param {type:"string"}
 BASE_CONFIG_NAME = "dm4ct_ct512_uncond"  #@param ["dm4ct_ct512_uncond"]
-ALGO_NAME = "dps"  #@param ["dps", "reddiff"]
+ALGO_NAME = "dps_nonlinear"  #@param ["dps_nonlinear", "dps", "reddiff"]
 
 SEED = 99  #@param {type:"integer"}
 TOTAL_IMAGES = 3  #@param {type:"integer"}
@@ -509,7 +668,13 @@ NUM_ANGLES = 80  #@param {type:"integer"}
 NUM_DETECTORS = 512  #@param {type:"integer"}
 ATTENUATION_MIN = 0.0  #@param {type:"number"}
 ATTENUATION_MAX = 1.0  #@param {type:"number"}
-CT_LOSS_REDUCTION = "mean"  #@param ["mean", "sum"]
+CT_LOSS_REDUCTION = "sum"  #@param ["sum", "mean"]
+
+# DPS Nonlinear settings from Li et al. The paper tunes k per setting; 310 is
+# their reported low-dose starting point and should be retuned only globally.
+DPS_NONLINEAR_K = 310.0  #@param {type:"number"}
+DPS_NONLINEAR_DDIM_ETA = 0.0  #@param {type:"number"}
+DPS_NONLINEAR_INIT_MODE = "noise"  #@param ["noise", "pinv"]
 
 # DPS settings in this RED-diff repo.
 DPS_GRAD_TERM_WEIGHT = 1.0  #@param {type:"number"}
@@ -626,7 +791,12 @@ print(f"DM4CT model reference: {DM4CT_MODEL_REF}")
 """,
         cell_id="install",
     ),
-    code_cell(f"CT_DEGRADATION_CODE = {CT_DEGRADATION_CODE!r}\n\n{PATCH_CELL}", cell_id="patch-ct"),
+    code_cell(
+        f"CT_DEGRADATION_CODE = {CT_DEGRADATION_CODE!r}\n\n"
+        f"DPS_NONLINEAR_CODE = {DPS_NONLINEAR_CODE!r}\n\n"
+        f"{PATCH_CELL}",
+        cell_id="patch-ct",
+    ),
     code_cell(
         """#@title Prepare CT Slices For The RED-diff Dataset Loader
 import json
@@ -832,7 +1002,15 @@ run_cmd = [
     f"++algo.operator.loss_reduction={CT_LOSS_REDUCTION}",
 ]
 
-if ALGO_NAME == "dps":
+if ALGO_NAME == "dps_nonlinear":
+    run_cmd.extend([
+        "algo.awd=true",
+        f"algo.likelihood_weight={float(DPS_NONLINEAR_K)}",
+        f"algo.eta={float(DPS_NONLINEAR_DDIM_ETA)}",
+        f"algo.init_mode={DPS_NONLINEAR_INIT_MODE}",
+        "++algo.gradient_eps=1.0e-12",
+    ])
+elif ALGO_NAME == "dps":
     run_cmd.extend([
         "algo.awd=true",
         f"algo.grad_term_weight={float(DPS_GRAD_TERM_WEIGHT)}",
@@ -857,7 +1035,11 @@ print(f"Run slug: {run_slug}")
 print(f"Algorithm: {ALGO_NAME}")
 print(f"Prepared images: {len(prepared_files)}")
 print(f"Effective batch size: {effective_batch_size}")
-if ALGO_NAME == "dps":
+if ALGO_NAME == "dps_nonlinear":
+    print(f"DPS Nonlinear k: {DPS_NONLINEAR_K}")
+    print(f"DPS Nonlinear DDIM eta: {DPS_NONLINEAR_DDIM_ETA}")
+    print(f"DPS Nonlinear init mode: {DPS_NONLINEAR_INIT_MODE}")
+elif ALGO_NAME == "dps":
     print(f"DPS guidance weight: {DPS_GRAD_TERM_WEIGHT}")
     print(f"DPS DDIM eta: {DPS_DDIM_ETA}")
 else:

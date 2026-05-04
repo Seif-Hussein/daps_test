@@ -8,6 +8,7 @@ from .reddiff import REDDIFF
 from .reddiff_parallel import REDDIFF_PARALLEL
 from .mcg import MCG
 from .dps import DPS
+from .dps_nonlinear import DPSNonlinear
 from .sds import SDS
 from .sds_var import SDS_VAR
 
@@ -29,6 +30,8 @@ def build_algo(cg_model, cfg):
         return MCG(cg_model, cfg)
     elif cfg.algo.name == 'dps':
         return DPS(cg_model, cfg)
+    elif cfg.algo.name == 'dps_nonlinear':
+        return DPSNonlinear(cg_model, cfg)
     elif cfg.algo.name == 'sds':
         return SDS(cg_model, cfg)
     elif cfg.algo.name == 'sds_var':
